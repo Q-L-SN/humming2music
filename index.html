@@ -10,11 +10,6 @@
     .wrap{max-width:720px;margin:0 auto;padding:16px 16px 80px;}
     h1{font-size:20px;margin:8px 0 12px;}
     .panel{background:var(--card);border-radius:12px;padding:14px;margin:12px 0;}
-    .row{display:flex;align-items:center;gap:12px;margin:8px 0;}
-    .row label{flex:0 0 120px;color:var(--muted);font-size:14px;}
-    .row .val{min-width:64px;text-align:right;color:var(--fg);font-variant-numeric:tabular-nums;}
-    input[type="range"]{flex:1;appearance:none;height:4px;background:#2a2c32;border-radius:99px;outline:none;}
-    input[type="range"]::-webkit-slider-thumb{appearance:none;width:22px;height:22px;border-radius:50%;background:var(--acc);border:none;}
     .bigbtn{display:block;width:100%;padding:16px;border-radius:14px;border:none;background:var(--acc);color:#fff;font-weight:700;font-size:18px;}
     .bigbtn[aria-pressed="true"]{background:#d64545;}
     .note{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.4;}
@@ -28,25 +23,20 @@
     .actions a,.actions button{background:#1f2126;border:1px solid #2d2f36;color:#fff;border-radius:10px;padding:8px 10px;font-size:12px;text-decoration:none}
     audio{display:none}
     .busy{opacity:.6;pointer-events:none;filter:grayscale(.1)}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1f2126;border:1px solid #2d2f36;color:#d0d3d8;font-size:12px;margin-right:6px}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>哼唱转音乐</h1>
 
-    <div class="panel" id="ctrls">
-      <div class="row">
-        <label><strong>FFT窗宽</strong></label>
-        <!-- 单位：毫秒 -->
-        <input id="win" type="range" min="10" max="200" step="1" value="90" />
-        <div class="val" id="winVal">90 ms</div>
+    <div class="panel">
+      <div class="note">
+        <span class="pill"><strong>窗宽</strong> 40 ms</span>
+        <span class="pill"><strong>覆盖率</strong> 0.85</span>
+        <span class="pill"><strong>最短片段</strong> 80 ms</span>
+        <span class="pill"><strong>频率</strong> 70–1000 Hz</span>
       </div>
-      <div class="row">
-        <label><strong>覆盖率</strong></label>
-        <input id="ovl" type="range" min="0" max="9" step="1" value="5" />
-        <div class="val" id="ovlVal">0.50</div>
-      </div>
-      <div class="note">窗宽以毫秒计（10–200 ms）。覆盖率指帧间重叠比例。录制中禁改。</div>
     </div>
 
     <div class="panel">
@@ -66,30 +56,23 @@
     import { YIN } from 'https://esm.sh/pitchfinder@2.3.2';
     import toWav from 'https://esm.sh/audiobuffer-to-wav@1.0.0';
 
+    // —— 固定参数（最佳实践） ——
+    const PARAMS = {
+      windowMs: 40,          // 窗宽
+      overlap: 0.85,         // 覆盖率（步长≈6ms）
+      minDurSec: 0.08,       // 最短片段
+      minFreq: 70,           // 频率范围
+      maxFreq: 1000
+    };
+
     const recBtn = document.getElementById('recBtn');
     const statusEl = document.getElementById('status');
-    const winSlider = document.getElementById('win');
-    const ovlSlider = document.getElementById('ovl');
-    const winVal = document.getElementById('winVal');
-    const ovlVal = document.getElementById('ovlVal');
     const tracks = document.getElementById('tracks');
-
-    const getWindowMs = () => Number(winSlider.value);     // 用户选择的毫秒
-    const getOverlap = () => Number(ovlSlider.value)/10;   // 0.0–0.9
 
     let audioCtx = null;
     let mediaStream = null;
     let mediaRecorder = null;
-    let chunks = [];
     let isRecording = false;
-
-    function syncSliderLabels() {
-      winVal.textContent = `${getWindowMs().toFixed(0)} ms`;
-      ovlVal.textContent = getOverlap().toFixed(2);
-    }
-    syncSliderLabels();
-    winSlider.addEventListener('input', syncSliderLabels);
-    ovlSlider.addEventListener('input', syncSliderLabels);
 
     async function ensureAudioContext() {
       if (!audioCtx) {
@@ -108,9 +91,7 @@
         'audio/webm',
         ''
       ];
-      for (const t of cands) {
-        try { if (!t || MediaRecorder.isTypeSupported(t)) return t; } catch(_) {}
-      }
+      for (const t of cands) { try { if (!t || MediaRecorder.isTypeSupported(t)) return t; } catch(_) {} }
       return '';
     }
 
@@ -128,16 +109,10 @@
       const type = preferredMime();
       mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType:type } : undefined);
 
-      chunks = [];
-      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-      mediaRecorder.start();
-
       isRecording = true;
       recBtn.textContent = '停止并处理';
       recBtn.setAttribute('aria-pressed','true');
       statusEl.textContent = '录制中…';
-      winSlider.disabled = true;
-      ovlSlider.disabled = true;
     }
 
     function stopTracks() {
@@ -145,16 +120,28 @@
       mediaStream = null;
     }
 
-    function waitForFinalChunk(rec) {
+    // —— 停止并收集音频：确保拿到最终 dataavailable —— 
+    function stopAndCollect(rec) {
       return new Promise((resolve) => {
-        let gotData = false, stopped = false;
+        const chunks = [];
+        let gotData = false;
+
         const onData = (e) => {
-          if (e.data && e.data.size) { chunks.push(e.data); gotData = true; if (stopped) done(); }
+          if (e.data && e.data.size) { chunks.push(e.data); gotData = true; }
         };
-        const onStop = () => { stopped = true; if (gotData) done(); };
-        function done(){ rec.removeEventListener('dataavailable', onData); rec.removeEventListener('stop', onStop); resolve(); }
         rec.addEventListener('dataavailable', onData);
-        rec.addEventListener('stop', onStop);
+
+        rec.addEventListener('stop', () => {
+          const finish = () => {
+            rec.removeEventListener('dataavailable', onData);
+            const blob = new Blob(chunks, { type: rec.mimeType || 'audio/mp4' });
+            resolve(blob);
+          };
+          if (gotData) finish();
+          else rec.addEventListener('dataavailable', () => finish(), { once: true });
+        }, { once: true });
+
+        rec.stop();
       });
     }
 
@@ -167,24 +154,15 @@
       statusEl.textContent = '处理中…';
       setBusy(true);
 
-      const wait = waitForFinalChunk(mediaRecorder);
-      mediaRecorder.stop();
-      await wait;
+      const blob = await stopAndCollect(mediaRecorder);
       stopTracks();
-
-      const curType = mediaRecorder.mimeType || 'audio/mp4';
-      const curChunks = chunks.slice(0);
-      chunks = [];
       mediaRecorder = null;
 
       await ensureAudioContext();
-      const blob = new Blob(curChunks, { type: curType });
       const arrBuf = await blob.arrayBuffer();
       const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
 
-      const windowMs = getWindowMs();
-      const overlap = getOverlap();
-      const events = extractQuantizedMelody(rawBuffer, windowMs, overlap);
+      const events = extractQuantizedMelody(rawBuffer, PARAMS);
 
       const duration = events.totalDuration + 0.4;
       const rendered = await Tone.Offline(() => {
@@ -201,12 +179,10 @@
       const musicBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
       addTrackItem(makeTitle(), musicBlob, {
-        meta: `窗宽 ${windowMs.toFixed(0)} ms | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
+        meta: `窗宽 40ms | 覆盖率 0.85 | 片段 ${events.notes.length}`
       });
 
       statusEl.textContent = '完成';
-      winSlider.disabled = false;
-      ovlSlider.disabled = false;
       setBusy(false);
     }
 
@@ -219,20 +195,17 @@
         statusEl.textContent = '失败：' + String(err && err.message || err);
         recBtn.textContent = '开始录制';
         recBtn.setAttribute('aria-pressed','false');
-        winSlider.disabled = false;
-        ovlSlider.disabled = false;
         setBusy(false);
         stopTracks();
         mediaRecorder = null;
-        chunks = [];
       }
     });
 
-    // —— 半音量化旋律提取（窗宽以毫秒传入，内部换算为采样点） ——
-    function extractQuantizedMelody(audioBuffer, windowMs, overlapRatio) {
+    // —— 半音量化旋律提取（固定参数） ——
+    function extractQuantizedMelody(audioBuffer, cfg) {
       const sr = audioBuffer.sampleRate;
-      const windowSamples = Math.max(1, Math.round(windowMs * sr / 1000));
-      const hop = Math.max(1, Math.round(windowSamples * (1 - overlapRatio)));
+      const windowSamples = Math.max(1, Math.round(cfg.windowMs * sr / 1000));
+      const hop = Math.max(1, Math.round(windowSamples * (1 - cfg.overlap)));
 
       const ch = audioBuffer.numberOfChannels > 1
         ? mixToMono(audioBuffer)
@@ -241,19 +214,19 @@
       const yin = YIN({ sampleRate: sr });
       const N = ch.length;
       const rawNotes = [];
-      const minFreq = 60, maxFreq = 1200;
 
       for (let i = 0; i + windowSamples <= N; i += hop) {
         const frame = ch.subarray(i, i + windowSamples);
         const f0 = yin(frame);
-        rawNotes.push((f0 && isFinite(f0) && f0 >= minFreq && f0 <= maxFreq) ? f0 : null);
+        if (!f0 || !isFinite(f0) || f0 < cfg.minFreq || f0 > cfg.maxFreq) rawNotes.push(null);
+        else rawNotes.push(f0);
       }
 
       const frameDur = hop / sr;
       const quantized = rawNotes.map(f => f ? midiToFreq(Math.round(freqToMidi(f))) : null);
 
       const events = [];
-      const MIN_DUR = 0.12;
+      const MIN_DUR = cfg.minDurSec;
       let t = 0, i = 0;
       while (i < quantized.length) {
         const f = quantized[i];
@@ -316,9 +289,6 @@
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) document.querySelectorAll('#tracks audio').forEach(a => a.pause());
     });
-
-    winSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
-    ovlSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
   </script>
 </body>
 </html>
