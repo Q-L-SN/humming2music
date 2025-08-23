@@ -101,7 +101,6 @@
     }
 
     function preferredMime() {
-      // Safari 优先 AAC/mp4，其次 webm/opus，最后浏览器自行决定
       const cands = [
         'audio/mp4;codecs=mp4a.40.2',
         'audio/mp4',
@@ -110,20 +109,14 @@
         ''
       ];
       for (const t of cands) {
-        try {
-          if (!t || MediaRecorder.isTypeSupported(t)) return t;
-        } catch(_) { /* 某些旧实现没有 isTypeSupported */ }
+        try { if (!t || MediaRecorder.isTypeSupported(t)) return t; } catch(_) {}
       }
       return '';
     }
 
     function setBusy(on) {
-      if (on) {
-        document.body.classList.add('busy');
-        statusEl.textContent = '处理中…';
-      } else {
-        document.body.classList.remove('busy');
-      }
+      if (on) { document.body.classList.add('busy'); statusEl.textContent='处理中…'; }
+      else { document.body.classList.remove('busy'); }
     }
 
     async function startRecording() {
@@ -134,11 +127,12 @@
       });
 
       const type = preferredMime();
-      mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType: type } : undefined);
-      chunks = [];
+      mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType:type } : undefined);
 
-      mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-      mediaRecorder.start(); // iOS: 单次 start 即可，数据在 stop 时统一吐出
+      chunks = []; // 每次全新数组
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+
+      mediaRecorder.start();
 
       isRecording = true;
       recBtn.textContent = '停止并处理';
@@ -153,6 +147,32 @@
       mediaStream = null;
     }
 
+    // 等待“已停止且收到了最后一个 dataavailable”
+    function waitForFinalChunk(rec) {
+      return new Promise((resolve) => {
+        let gotData = false, stopped = false;
+        const onData = (e) => {
+          if (e.data && e.data.size) {
+            chunks.push(e.data);
+            gotData = true;
+            if (stopped) done();
+          }
+        };
+        const onStop = () => {
+          stopped = true;
+          // 某些 Safari 在 stop 后才发最后一个 dataavailable
+          if (gotData) done();
+        };
+        function done() {
+          rec.removeEventListener('dataavailable', onData);
+          rec.removeEventListener('stop', onStop);
+          resolve();
+        }
+        rec.addEventListener('dataavailable', onData);
+        rec.addEventListener('stop', onStop);
+      });
+    }
+
     async function stopRecordingAndProcess() {
       if (!mediaRecorder) return;
 
@@ -162,28 +182,28 @@
       statusEl.textContent = '处理中…';
       setBusy(true);
 
-      const stopped = new Promise(resolve => {
-        mediaRecorder.onstop = resolve;
-      });
+      const wait = waitForFinalChunk(mediaRecorder);
       mediaRecorder.stop();
-      await stopped;
+      await wait;
 
       stopTracks();
 
-      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/mp4' });
+      // 复制并立刻清空，避免下一轮误用
+      const curType = mediaRecorder.mimeType || 'audio/mp4';
+      const curChunks = chunks.slice(0);
       chunks = [];
+      mediaRecorder = null;
 
-      // 解码为 AudioBuffer
+      const blob = new Blob(curChunks, { type: curType });
+
       await ensureAudioContext();
       const arrBuf = await blob.arrayBuffer();
       const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
 
-      // 分析 -> 半音量化 -> 事件序列
       const windowSize = getWindowSize();
       const overlap = getOverlap();
       const events = extractQuantizedMelody(rawBuffer, windowSize, overlap);
 
-      // Tone.js 离线合成
       const duration = events.totalDuration + 0.4;
       const rendered = await Tone.Offline(() => {
         const synth = new Tone.Synth({
@@ -223,10 +243,12 @@
         ovlSlider.disabled = false;
         setBusy(false);
         stopTracks();
+        mediaRecorder = null;
+        chunks = [];
       }
     });
 
-    // —— 半音量化旋律提取（保持原逻辑） ——
+    // —— 半音量化旋律提取 ——
     function extractQuantizedMelody(audioBuffer, windowSize, overlapRatio) {
       const sr = audioBuffer.sampleRate;
       const hop = Math.max(1, Math.round(windowSize * (1 - overlapRatio)));
@@ -309,9 +331,9 @@
       window.addEventListener('beforeunload', () => URL.revokeObjectURL(url));
     }
 
-    document.addEventListener('visibilitychange', () => { if (document.hidden) {
-      document.querySelectorAll('#tracks audio').forEach(a => a.pause());
-    }});
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) document.querySelectorAll('#tracks audio').forEach(a => a.pause());
+    });
 
     winSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
     ovlSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
