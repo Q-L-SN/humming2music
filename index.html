@@ -37,15 +37,16 @@
     <div class="panel" id="ctrls">
       <div class="row">
         <label><strong>FFT窗宽</strong></label>
-        <input id="win" type="range" min="0" max="4" step="1" value="2" />
-        <div class="val" id="winVal">0.00 ms</div>
+        <!-- 单位：毫秒 -->
+        <input id="win" type="range" min="10" max="200" step="1" value="90" />
+        <div class="val" id="winVal">90 ms</div>
       </div>
       <div class="row">
         <label><strong>覆盖率</strong></label>
         <input id="ovl" type="range" min="0" max="9" step="1" value="5" />
         <div class="val" id="ovlVal">0.50</div>
       </div>
-      <div class="note">说明：窗宽用毫秒显示；覆盖率指帧与帧的重叠比例。录制中禁改。</div>
+      <div class="note">窗宽以毫秒计（10–200 ms）。覆盖率指帧间重叠比例。录制中禁改。</div>
     </div>
 
     <div class="panel">
@@ -73,10 +74,8 @@
     const ovlVal = document.getElementById('ovlVal');
     const tracks = document.getElementById('tracks');
 
-    // **内部仍以样本数工作**，但显示为 ms
-    const WINDOW_SAMPLES = [2048, 4096, 8192, 12288, 16384];
-    const getWindowSamples = () => WINDOW_SAMPLES[Number(winSlider.value)];
-    const getOverlap = () => Number(ovlSlider.value)/10;
+    const getWindowMs = () => Number(winSlider.value);     // 用户选择的毫秒
+    const getOverlap = () => Number(ovlSlider.value)/10;   // 0.0–0.9
 
     let audioCtx = null;
     let mediaStream = null;
@@ -84,18 +83,8 @@
     let chunks = [];
     let isRecording = false;
 
-    function msFromSamples(samples, sr) {
-      return samples / sr * 1000;
-    }
-    function formatMs(ms) {
-      return (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)) + ' ms';
-    }
-
-    // —— 根据实际/默认采样率刷新显示（默认按 44100Hz 估算） ——
     function syncSliderLabels() {
-      const sr = (audioCtx && audioCtx.sampleRate) || 44100;
-      const ms = msFromSamples(getWindowSamples(), sr);
-      winVal.textContent = formatMs(ms);
+      winVal.textContent = `${getWindowMs().toFixed(0)} ms`;
       ovlVal.textContent = getOverlap().toFixed(2);
     }
     syncSliderLabels();
@@ -106,8 +95,6 @@
       if (!audioCtx) {
         const AC = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AC({ sampleRate: 44100 });
-        // 新建后，用真实采样率刷新一次“ms”显示
-        syncSliderLabels();
       }
       if (audioCtx.state !== 'running') await audioCtx.resume();
       return audioCtx;
@@ -195,10 +182,9 @@
       const arrBuf = await blob.arrayBuffer();
       const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
 
-      // —— 分析参数：样本窗宽仍按 slider 对应样本数；ms 用真实 sr 计算显示 ——
-      const windowSamples = getWindowSamples();
+      const windowMs = getWindowMs();
       const overlap = getOverlap();
-      const events = extractQuantizedMelody(rawBuffer, windowSamples, overlap);
+      const events = extractQuantizedMelody(rawBuffer, windowMs, overlap);
 
       const duration = events.totalDuration + 0.4;
       const rendered = await Tone.Offline(() => {
@@ -214,17 +200,14 @@
       const wavBuffer = toWav(rendered);
       const musicBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
-      const msLabel = formatMs(msFromSamples(windowSamples, rawBuffer.sampleRate));
       addTrackItem(makeTitle(), musicBlob, {
-        meta: `窗宽 ${msLabel} | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
+        meta: `窗宽 ${windowMs.toFixed(0)} ms | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
       });
 
       statusEl.textContent = '完成';
       winSlider.disabled = false;
       ovlSlider.disabled = false;
       setBusy(false);
-      // 刷新一次显示，避免用户在新一轮前看到估算值
-      syncSliderLabels();
     }
 
     recBtn.addEventListener('click', async () => {
@@ -245,10 +228,12 @@
       }
     });
 
-    // —— 半音量化旋律提取 ——
-    function extractQuantizedMelody(audioBuffer, windowSizeSamples, overlapRatio) {
+    // —— 半音量化旋律提取（窗宽以毫秒传入，内部换算为采样点） ——
+    function extractQuantizedMelody(audioBuffer, windowMs, overlapRatio) {
       const sr = audioBuffer.sampleRate;
-      const hop = Math.max(1, Math.round(windowSizeSamples * (1 - overlapRatio)));
+      const windowSamples = Math.max(1, Math.round(windowMs * sr / 1000));
+      const hop = Math.max(1, Math.round(windowSamples * (1 - overlapRatio)));
+
       const ch = audioBuffer.numberOfChannels > 1
         ? mixToMono(audioBuffer)
         : audioBuffer.getChannelData(0);
@@ -258,8 +243,8 @@
       const rawNotes = [];
       const minFreq = 60, maxFreq = 1200;
 
-      for (let i = 0; i + windowSizeSamples <= N; i += hop) {
-        const frame = ch.subarray(i, i + windowSizeSamples);
+      for (let i = 0; i + windowSamples <= N; i += hop) {
+        const frame = ch.subarray(i, i + windowSamples);
         const f0 = yin(frame);
         rawNotes.push((f0 && isFinite(f0) && f0 >= minFreq && f0 <= maxFreq) ? f0 : null);
       }
