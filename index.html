@@ -38,14 +38,14 @@
       <div class="row">
         <label><strong>FFT窗宽</strong></label>
         <input id="win" type="range" min="0" max="4" step="1" value="2" />
-        <div class="val" id="winVal">4096</div>
+        <div class="val" id="winVal">0.00 ms</div>
       </div>
       <div class="row">
         <label><strong>覆盖率</strong></label>
         <input id="ovl" type="range" min="0" max="9" step="1" value="5" />
         <div class="val" id="ovlVal">0.50</div>
       </div>
-      <div class="note">说明：窗宽越大，低频分辨率更好但时域响应更慢。覆盖率指帧与帧的重叠比例。录制中禁改。</div>
+      <div class="note">说明：窗宽用毫秒显示；覆盖率指帧与帧的重叠比例。录制中禁改。</div>
     </div>
 
     <div class="panel">
@@ -73,17 +73,10 @@
     const ovlVal = document.getElementById('ovlVal');
     const tracks = document.getElementById('tracks');
 
-    const WINDOW_OPTIONS = [2048, 4096, 8192, 12288, 16384];
-    const getWindowSize = () => WINDOW_OPTIONS[Number(winSlider.value)];
+    // **内部仍以样本数工作**，但显示为 ms
+    const WINDOW_SAMPLES = [2048, 4096, 8192, 12288, 16384];
+    const getWindowSamples = () => WINDOW_SAMPLES[Number(winSlider.value)];
     const getOverlap = () => Number(ovlSlider.value)/10;
-
-    const syncSliderLabels = () => {
-      winVal.textContent = String(getWindowSize());
-      ovlVal.textContent = getOverlap().toFixed(2);
-    };
-    syncSliderLabels();
-    winSlider.addEventListener('input', syncSliderLabels);
-    ovlSlider.addEventListener('input', syncSliderLabels);
 
     let audioCtx = null;
     let mediaStream = null;
@@ -91,10 +84,30 @@
     let chunks = [];
     let isRecording = false;
 
+    function msFromSamples(samples, sr) {
+      return samples / sr * 1000;
+    }
+    function formatMs(ms) {
+      return (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)) + ' ms';
+    }
+
+    // —— 根据实际/默认采样率刷新显示（默认按 44100Hz 估算） ——
+    function syncSliderLabels() {
+      const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+      const ms = msFromSamples(getWindowSamples(), sr);
+      winVal.textContent = formatMs(ms);
+      ovlVal.textContent = getOverlap().toFixed(2);
+    }
+    syncSliderLabels();
+    winSlider.addEventListener('input', syncSliderLabels);
+    ovlSlider.addEventListener('input', syncSliderLabels);
+
     async function ensureAudioContext() {
       if (!audioCtx) {
         const AC = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AC({ sampleRate: 44100 });
+        // 新建后，用真实采样率刷新一次“ms”显示
+        syncSliderLabels();
       }
       if (audioCtx.state !== 'running') await audioCtx.resume();
       return audioCtx;
@@ -125,13 +138,11 @@
         audio: { echoCancellation:true, noiseSuppression:true },
         video: false
       });
-
       const type = preferredMime();
       mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType:type } : undefined);
 
-      chunks = []; // 每次全新数组
+      chunks = [];
       mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-
       mediaRecorder.start();
 
       isRecording = true;
@@ -147,27 +158,14 @@
       mediaStream = null;
     }
 
-    // 等待“已停止且收到了最后一个 dataavailable”
     function waitForFinalChunk(rec) {
       return new Promise((resolve) => {
         let gotData = false, stopped = false;
         const onData = (e) => {
-          if (e.data && e.data.size) {
-            chunks.push(e.data);
-            gotData = true;
-            if (stopped) done();
-          }
+          if (e.data && e.data.size) { chunks.push(e.data); gotData = true; if (stopped) done(); }
         };
-        const onStop = () => {
-          stopped = true;
-          // 某些 Safari 在 stop 后才发最后一个 dataavailable
-          if (gotData) done();
-        };
-        function done() {
-          rec.removeEventListener('dataavailable', onData);
-          rec.removeEventListener('stop', onStop);
-          resolve();
-        }
+        const onStop = () => { stopped = true; if (gotData) done(); };
+        function done(){ rec.removeEventListener('dataavailable', onData); rec.removeEventListener('stop', onStop); resolve(); }
         rec.addEventListener('dataavailable', onData);
         rec.addEventListener('stop', onStop);
       });
@@ -185,24 +183,22 @@
       const wait = waitForFinalChunk(mediaRecorder);
       mediaRecorder.stop();
       await wait;
-
       stopTracks();
 
-      // 复制并立刻清空，避免下一轮误用
       const curType = mediaRecorder.mimeType || 'audio/mp4';
       const curChunks = chunks.slice(0);
       chunks = [];
       mediaRecorder = null;
 
-      const blob = new Blob(curChunks, { type: curType });
-
       await ensureAudioContext();
+      const blob = new Blob(curChunks, { type: curType });
       const arrBuf = await blob.arrayBuffer();
       const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
 
-      const windowSize = getWindowSize();
+      // —— 分析参数：样本窗宽仍按 slider 对应样本数；ms 用真实 sr 计算显示 ——
+      const windowSamples = getWindowSamples();
       const overlap = getOverlap();
-      const events = extractQuantizedMelody(rawBuffer, windowSize, overlap);
+      const events = extractQuantizedMelody(rawBuffer, windowSamples, overlap);
 
       const duration = events.totalDuration + 0.4;
       const rendered = await Tone.Offline(() => {
@@ -212,22 +208,23 @@
         }).toDestination();
         const reverb = new Tone.Reverb({ decay: 1.4, wet: 0.2 }).toDestination();
         synth.connect(reverb);
-        for (const ev of events.notes) {
-          synth.triggerAttackRelease(ev.freq, ev.dur, ev.time);
-        }
+        for (const ev of events.notes) synth.triggerAttackRelease(ev.freq, ev.dur, ev.time);
       }, duration);
 
       const wavBuffer = toWav(rendered);
       const musicBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
+      const msLabel = formatMs(msFromSamples(windowSamples, rawBuffer.sampleRate));
       addTrackItem(makeTitle(), musicBlob, {
-        meta: `窗宽 ${windowSize} | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
+        meta: `窗宽 ${msLabel} | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
       });
 
       statusEl.textContent = '完成';
       winSlider.disabled = false;
       ovlSlider.disabled = false;
       setBusy(false);
+      // 刷新一次显示，避免用户在新一轮前看到估算值
+      syncSliderLabels();
     }
 
     recBtn.addEventListener('click', async () => {
@@ -249,9 +246,9 @@
     });
 
     // —— 半音量化旋律提取 ——
-    function extractQuantizedMelody(audioBuffer, windowSize, overlapRatio) {
+    function extractQuantizedMelody(audioBuffer, windowSizeSamples, overlapRatio) {
       const sr = audioBuffer.sampleRate;
-      const hop = Math.max(1, Math.round(windowSize * (1 - overlapRatio)));
+      const hop = Math.max(1, Math.round(windowSizeSamples * (1 - overlapRatio)));
       const ch = audioBuffer.numberOfChannels > 1
         ? mixToMono(audioBuffer)
         : audioBuffer.getChannelData(0);
@@ -261,8 +258,8 @@
       const rawNotes = [];
       const minFreq = 60, maxFreq = 1200;
 
-      for (let i = 0; i + windowSize <= N; i += hop) {
-        const frame = ch.subarray(i, i + windowSize);
+      for (let i = 0; i + windowSizeSamples <= N; i += hop) {
+        const frame = ch.subarray(i, i + windowSizeSamples);
         const f0 = yin(frame);
         rawNotes.push((f0 && isFinite(f0) && f0 >= minFreq && f0 <= maxFreq) ? f0 : null);
       }
