@@ -29,8 +29,6 @@
     audio{display:none}
     .busy{opacity:.6;pointer-events:none;filter:grayscale(.1)}
   </style>
-  <!-- 录音库（全局 Recorder） -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Recorderjs/0.1.0/recorder.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body>
   <div class="wrap">
@@ -38,12 +36,12 @@
 
     <div class="panel" id="ctrls">
       <div class="row">
-        <label>**FFT窗宽**</label>
+        <label><strong>FFT窗宽</strong></label>
         <input id="win" type="range" min="0" max="4" step="1" value="2" />
         <div class="val" id="winVal">4096</div>
       </div>
       <div class="row">
-        <label>**覆盖率**</label>
+        <label><strong>覆盖率</strong></label>
         <input id="ovl" type="range" min="0" max="9" step="1" value="5" />
         <div class="val" id="ovlVal">0.50</div>
       </div>
@@ -63,26 +61,22 @@
   </div>
 
   <script type="module">
-    // 第三方库（ESM）
     import * as Tone from 'https://esm.sh/tone@14.8.49';
     import { YIN } from 'https://esm.sh/pitchfinder@2.3.2';
     import toWav from 'https://esm.sh/audiobuffer-to-wav@1.0.0';
 
-    // ====== 基础状态 ======
     const recBtn = document.getElementById('recBtn');
     const statusEl = document.getElementById('status');
     const winSlider = document.getElementById('win');
     const ovlSlider = document.getElementById('ovl');
     const winVal = document.getElementById('winVal');
     const ovlVal = document.getElementById('ovlVal');
-    const ctrls = document.getElementById('ctrls');
     const tracks = document.getElementById('tracks');
 
-    const WINDOW_OPTIONS = [2048, 4096, 8192, 12288, 16384]; // iPhone 也能跑的范围
+    const WINDOW_OPTIONS = [2048, 4096, 8192, 12288, 16384];
     const getWindowSize = () => WINDOW_OPTIONS[Number(winSlider.value)];
-    const getOverlap = () => Number(ovlSlider.value)/10; // 0.0-0.9
+    const getOverlap = () => Number(ovlSlider.value)/10;
 
-    // UI 数值初始化
     const syncSliderLabels = () => {
       winVal.textContent = String(getWindowSize());
       ovlVal.textContent = getOverlap().toFixed(2);
@@ -91,23 +85,36 @@
     winSlider.addEventListener('input', syncSliderLabels);
     ovlSlider.addEventListener('input', syncSliderLabels);
 
-    // 录制相关
     let audioCtx = null;
     let mediaStream = null;
-    let sourceNode = null;
-    let recorder = null;
+    let mediaRecorder = null;
+    let chunks = [];
     let isRecording = false;
 
-    // iOS 需要用户手势恢复音频上下文
     async function ensureAudioContext() {
       if (!audioCtx) {
         const AC = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AC({ sampleRate: 44100 });
       }
-      if (audioCtx.state !== 'running') {
-        await audioCtx.resume();
-      }
+      if (audioCtx.state !== 'running') await audioCtx.resume();
       return audioCtx;
+    }
+
+    function preferredMime() {
+      // Safari 优先 AAC/mp4，其次 webm/opus，最后浏览器自行决定
+      const cands = [
+        'audio/mp4;codecs=mp4a.40.2',
+        'audio/mp4',
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        ''
+      ];
+      for (const t of cands) {
+        try {
+          if (!t || MediaRecorder.isTypeSupported(t)) return t;
+        } catch(_) { /* 某些旧实现没有 isTypeSupported */ }
+      }
+      return '';
     }
 
     function setBusy(on) {
@@ -121,78 +128,79 @@
 
     async function startRecording() {
       await ensureAudioContext();
-      // iOS/Safari 必须 HTTPS + 用户手势
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
-      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-      // Recorder.js 需要 worker 路径
-      recorder = new window.Recorder(sourceNode, {
-        numChannels: 1,
-        workerPath: 'https://cdnjs.cloudflare.com/ajax/libs/Recorderjs/0.1.0/recorderWorker.min.js'
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:true, noiseSuppression:true },
+        video: false
       });
-      recorder && recorder.record();
+
+      const type = preferredMime();
+      mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType: type } : undefined);
+      chunks = [];
+
+      mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      mediaRecorder.start(); // iOS: 单次 start 即可，数据在 stop 时统一吐出
+
       isRecording = true;
       recBtn.textContent = '停止并处理';
       recBtn.setAttribute('aria-pressed','true');
       statusEl.textContent = '录制中…';
-      // 禁止录制中改动参数
       winSlider.disabled = true;
       ovlSlider.disabled = true;
     }
 
+    function stopTracks() {
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+
     async function stopRecordingAndProcess() {
-      if (!recorder) return;
+      if (!mediaRecorder) return;
+
       isRecording = false;
       recBtn.textContent = '开始录制';
       recBtn.setAttribute('aria-pressed','false');
       statusEl.textContent = '处理中…';
       setBusy(true);
 
-      recorder.stop();
+      const stopped = new Promise(resolve => {
+        mediaRecorder.onstop = resolve;
+      });
+      mediaRecorder.stop();
+      await stopped;
 
-      const wavBlob = await new Promise(resolve => recorder.exportWAV(resolve, 'audio/wav'));
-      recorder.clear();
+      stopTracks();
 
-      // 释放麦克风
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(t => t.stop());
-      }
-      sourceNode = null;
-      mediaStream = null;
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/mp4' });
+      chunks = [];
 
-      // 解码 WAV -> AudioBuffer
-      const arrBuf = await wavBlob.arrayBuffer();
+      // 解码为 AudioBuffer
+      await ensureAudioContext();
+      const arrBuf = await blob.arrayBuffer();
       const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
 
-      // 提取音高 -> 半音量化 -> 事件序列
+      // 分析 -> 半音量化 -> 事件序列
       const windowSize = getWindowSize();
       const overlap = getOverlap();
       const events = extractQuantizedMelody(rawBuffer, windowSize, overlap);
 
-      // 使用 Tone.js 离线渲染旋律
-      const duration = events.totalDuration + 0.4; // 余量
-      const rendered = await Tone.Offline(({ transport }) => {
+      // Tone.js 离线合成
+      const duration = events.totalDuration + 0.4;
+      const rendered = await Tone.Offline(() => {
         const synth = new Tone.Synth({
           oscillator: { type: 'triangle' },
           envelope: { attack: 0.01, decay: 0.08, sustain: 0.2, release: 0.2 }
         }).toDestination();
-
-        // 轻微混响美化（可注释）
         const reverb = new Tone.Reverb({ decay: 1.4, wet: 0.2 }).toDestination();
         synth.connect(reverb);
-
         for (const ev of events.notes) {
-          // 将半音量化后的频率直接用于合成
           synth.triggerAttackRelease(ev.freq, ev.dur, ev.time);
         }
       }, duration);
 
-      // 导出 WAV
       const wavBuffer = toWav(rendered);
       const musicBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
-      // 加入列表
-      const title = makeTitle();
-      addTrackItem(title, musicBlob, {
+      addTrackItem(makeTitle(), musicBlob, {
         meta: `窗宽 ${windowSize} | 覆盖率 ${overlap.toFixed(2)} | 片段 ${events.notes.length}`
       });
 
@@ -204,11 +212,8 @@
 
     recBtn.addEventListener('click', async () => {
       try {
-        if (!isRecording) {
-          await startRecording();
-        } else {
-          await stopRecordingAndProcess();
-        }
+        if (!isRecording) await startRecording();
+        else await stopRecordingAndProcess();
       } catch (err) {
         console.error(err);
         statusEl.textContent = '失败：' + String(err && err.message || err);
@@ -217,10 +222,11 @@
         winSlider.disabled = false;
         ovlSlider.disabled = false;
         setBusy(false);
+        stopTracks();
       }
     });
 
-    // ====== 核心算法：半音量化旋律提取 ======
+    // —— 半音量化旋律提取（保持原逻辑） ——
     function extractQuantizedMelody(audioBuffer, windowSize, overlapRatio) {
       const sr = audioBuffer.sampleRate;
       const hop = Math.max(1, Math.round(windowSize * (1 - overlapRatio)));
@@ -231,51 +237,38 @@
       const yin = YIN({ sampleRate: sr });
       const N = ch.length;
       const rawNotes = [];
-      const minFreq = 60;   // 过滤过低/噪声
-      const maxFreq = 1200; // 过滤过高/噪声
+      const minFreq = 60, maxFreq = 1200;
 
       for (let i = 0; i + windowSize <= N; i += hop) {
         const frame = ch.subarray(i, i + windowSize);
         const f0 = yin(frame);
-        if (!f0 || !isFinite(f0) || f0 < minFreq || f0 > maxFreq) {
-          rawNotes.push(null);
-        } else {
-          rawNotes.push(f0);
-        }
+        rawNotes.push((f0 && isFinite(f0) && f0 >= minFreq && f0 <= maxFreq) ? f0 : null);
       }
 
       const frameDur = hop / sr;
-      // 半音量化 + 简单去抖（把很短的抖动并入相邻）
       const quantized = rawNotes.map(f => f ? midiToFreq(Math.round(freqToMidi(f))) : null);
 
-      // 合并连续相同音 / 跳过很短的片段
       const events = [];
-      const MIN_DUR = 0.12; // s；过短的片段丢弃
-      let t = 0;
-      let i = 0;
+      const MIN_DUR = 0.12;
+      let t = 0, i = 0;
       while (i < quantized.length) {
         const f = quantized[i];
         let len = 1;
         while (i + len < quantized.length && quantized[i + len] === f) len++;
         const dur = len * frameDur;
-        if (f && dur >= MIN_DUR) {
-          events.push({ time: t, dur, freq: f });
-        }
+        if (f && dur >= MIN_DUR) events.push({ time: t, dur, freq: f });
         t += len * frameDur;
         i += len;
       }
-
       return { notes: events, totalDuration: t };
     }
 
-    // ====== 小工具：音高/半音换算、混音 ======
     function freqToMidi(f) { return 69 + 12 * Math.log2(f / 440); }
     function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 
     function mixToMono(buffer) {
-      const len = buffer.length;
+      const len = buffer.length, chs = buffer.numberOfChannels;
       const out = new Float32Array(len);
-      const chs = buffer.numberOfChannels;
       for (let c = 0; c < chs; c++) {
         const data = buffer.getChannelData(c);
         for (let i = 0; i < len; i++) out[i] += data[i] / chs;
@@ -284,104 +277,42 @@
     }
 
     function makeTitle() {
-      const d = new Date();
-      const pad = n => String(n).padStart(2,'0');
+      const d = new Date(), pad = n => String(n).padStart(2,'0');
       return `处理音乐_${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
     }
 
-    // ====== 列表与播放/导出 ======
     function addTrackItem(title, blob, { meta }) {
       const url = URL.createObjectURL(blob);
-
-      const li = document.createElement('li');
-      li.className = 'track';
-
-      const playBtn = document.createElement('button');
-      playBtn.className = 'play';
-      playBtn.textContent = '▶︎';
-
-      const audio = document.createElement('audio');
-      audio.src = url;
-      audio.preload = 'metadata';
-
-      const metaBox = document.createElement('div');
-      metaBox.className = 'meta';
-      const titleEl = document.createElement('div');
-      titleEl.className = 'title';
-      titleEl.textContent = title;
-      const sub = document.createElement('div');
-      sub.className = 'sub';
-      sub.textContent = meta || '';
-
-      metaBox.appendChild(titleEl);
-      metaBox.appendChild(sub);
-
-      const actions = document.createElement('div');
-      actions.className = 'actions';
-      const dl = document.createElement('a');
-      dl.textContent = '导出WAV';
-      dl.download = `${title}.wav`;
-      dl.href = url;
-      actions.appendChild(dl);
-
-      li.appendChild(playBtn);
-      li.appendChild(metaBox);
-      li.appendChild(actions);
-      li.appendChild(audio);
+      const li = document.createElement('li'); li.className = 'track';
+      const playBtn = document.createElement('button'); playBtn.className='play'; playBtn.textContent='▶︎';
+      const audio = document.createElement('audio'); audio.src=url; audio.preload='metadata';
+      const metaBox = document.createElement('div'); metaBox.className='meta';
+      const titleEl = document.createElement('div'); titleEl.className='title'; titleEl.textContent=title;
+      const sub = document.createElement('div'); sub.className='sub'; sub.textContent=meta||'';
+      metaBox.appendChild(titleEl); metaBox.appendChild(sub);
+      const actions = document.createElement('div'); actions.className='actions';
+      const dl = document.createElement('a'); dl.textContent='导出WAV'; dl.download=`${title}.wav`; dl.href=url; actions.appendChild(dl);
+      li.appendChild(playBtn); li.appendChild(metaBox); li.appendChild(actions); li.appendChild(audio);
       tracks.prepend(li);
 
       let isPlaying = false;
-
       function stopAllOthers() {
-        document.querySelectorAll('#tracks audio').forEach(a => {
-          if (a !== audio) a.pause();
-        });
-        document.querySelectorAll('#tracks .play').forEach(b => {
-          if (b !== playBtn) b.textContent = '▶︎';
-        });
+        document.querySelectorAll('#tracks audio').forEach(a => { if (a!==audio) a.pause(); });
+        document.querySelectorAll('#tracks .play').forEach(b => { if (b!==playBtn) b.textContent='▶︎'; });
       }
-
-      function toggle() {
-        stopAllOthers();
-        if (isPlaying) {
-          audio.pause();
-        } else {
-          audio.currentTime = audio.currentTime || 0;
-          audio.play();
-        }
-      }
-
-      playBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggle();
-      });
+      function toggle() { stopAllOthers(); isPlaying ? audio.pause() : audio.play(); }
+      playBtn.addEventListener('click', e => { e.stopPropagation(); toggle(); });
       li.addEventListener('click', () => toggle());
-
-      audio.addEventListener('play', () => {
-        isPlaying = true;
-        playBtn.textContent = '⏸︎';
-      });
-      audio.addEventListener('pause', () => {
-        isPlaying = false;
-        playBtn.textContent = '▶︎';
-      });
-      audio.addEventListener('ended', () => {
-        isPlaying = false;
-        playBtn.textContent = '▶︎';
-      });
-
-      // 释放 URL 的简单策略：页面卸载时统一释放
+      audio.addEventListener('play',  () => { isPlaying=true;  playBtn.textContent='⏸︎'; });
+      audio.addEventListener('pause', () => { isPlaying=false; playBtn.textContent='▶︎'; });
+      audio.addEventListener('ended', () => { isPlaying=false; playBtn.textContent='▶︎'; });
       window.addEventListener('beforeunload', () => URL.revokeObjectURL(url));
     }
 
-    // ====== 额外小修复：iOS 息屏/切后台时暂停播放 ======
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        document.querySelectorAll('#tracks audio').forEach(a => a.pause());
-      }
-    });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) {
+      document.querySelectorAll('#tracks audio').forEach(a => a.pause());
+    }});
 
-    // 防止录制冲突
     winSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
     ovlSlider.addEventListener('touchstart', e => { if (isRecording) e.preventDefault(); }, { passive:false });
   </script>
