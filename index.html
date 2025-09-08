@@ -12,25 +12,22 @@
     --ui:#0f172a;
     --muted:#64748b;
     --brand:#0ea5e9;
+    --danger:#ef4444;
   }
   html,body{height:100%;margin:0;background:var(--bg);color:var(--ui);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
   .wrap{display:flex;flex-direction:column;height:100%;max-width:900px;margin:0 auto;}
   header{padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;position:sticky;top:0;background:rgba(255,255,255,.85);backdrop-filter:saturate(1.2) blur(6px);z-index:3}
-  button,select,input{appearance:none;border:1px solid #cbd5e1;border-radius:12px;padding:10px 14px;background:#fff;color:var(--ui);font-size:15px}
+  button{appearance:none;border:1px solid #cbd5e1;border-radius:12px;padding:10px 14px;background:#fff;color:var(--ui);font-size:15px}
   button.primary{background:var(--brand);color:#fff;border-color:var(--brand)}
+  button.recOn{background:var(--danger);border-color:var(--danger);color:#fff}
   button:disabled{opacity:.5}
   .stat{font-size:13px;color:var(--muted);margin-left:auto}
   #lanes{flex:1;touch-action:none;position:relative;overflow:hidden}
-  .lane{
-    position:relative;height:14.2857%; user-select:none;
-  }
+  .lane{position:relative;height:14.2857%; user-select:none;}
   .lane:nth-child(odd){background:var(--lane-a)}
   .lane:nth-child(even){background:var(--lane-b)}
-  /* 修复点：用 overlay 叠加“变浅”，避免 Safari 对 filter 的刷新问题 */
-  .lane::after{
-    content:""; position:absolute; inset:0; background:rgba(255,255,255,0);
-    transition:background .06s ease;
-  }
+  /* 稳定变浅：叠加白色半透明层 */
+  .lane::after{content:""; position:absolute; inset:0; background:rgba(255,255,255,0); transition:background .06s ease;}
   .lane.active::after{ background:rgba(255,255,255,0.22); }
   .gutter{position:absolute;inset:auto 0 0 0;height:0}
   footer{border-top:1px solid #e2e8f0;padding:8px 14px;font-size:13px;color:var(--muted)}
@@ -43,8 +40,7 @@
 <body>
 <div class="wrap">
   <header>
-    <button id="btnInit" class="primary">启用麦克风 / 开始录制</button>
-    <button id="btnStop" disabled>停止</button>
+    <button id="btnRec" class="primary">启用麦克风 / 开始录制</button>
     <button id="btnPlay" disabled>播放旋律</button>
     <button id="btnExport" disabled>导出 MIDI</button>
     <label class="chips"><span class="chip">A4=440</span>
@@ -68,11 +64,12 @@
   </div>
 
   <div class="list mono" id="noteList" hidden></div>
-  <footer>提示：按住或划入色块表示**起音/换音**，抬手或划出表示**停音**；色块只作提示，不对应具体音高。</footer>
+  <footer>提示：按住或划入色块表示起音或换音，抬手或划出表示停音。色块仅提示事件，不对应具体音高。</footer>
 </div>
 
 <script>
 (() => {
+  // -------- 工具 --------
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
   const clamp = (x,min,max)=>Math.max(min,Math.min(max,x));
@@ -80,27 +77,29 @@
   const freq2midi = f => 69 + 12 * Math.log2(f/440);
   const cents = (f1,f2)=>1200*Math.log2(f1/f2);
 
-  let ctx, micStream, procNode, analyser;
+  // -------- 状态 --------
+  let ctx, micStream, procNode, analyser, zeroGain;
   let sampleRate = 48000;
-  let frameSize = 2048, hop = 1024;
+  let frameSize = 2048;
   let isRecording = false;
   let t0Ctx = 0;
   let laneActive = null;
 
-  const pitchBuf = [];           // {t,f0,amp}
-  const hintEvents = [];         // {t,type}
-  const notes = [];              // {midi,start,dur}
+  const pitchBuf = [];   // {t,f0,amp}
+  const notes = [];      // {midi,start,dur}
 
+  // -------- 参数（放宽门限，提高成功率） --------
   const MIN_F = 80, MAX_F = 1000;
-  const ENERGY_TH = 0.004;       // 略放宽，提升拾音稳定度
-  const MIN_NOTE_MS = 80;
-  const ALIGN_WIN = 0.18;
-  const RELEASE_GAP = 0.12;
+  const ENERGY_TH = 0.0005;   // 更低的静音门限
+  const MIN_NOTE_MS = 70;
+  const RELEASE_GAP = 0.10;
 
+  // 震动
   const vibrateOK = 'vibrate' in navigator;
   $('#vibChip').textContent = `Vibrate: ${vibrateOK ? 'on' : 'off'}`;
-  const vib = ms => { if (vibrateOK) try { navigator.vibrate(ms); } catch(e){} };
+  const vib = ms => { if (vibrateOK) try{ navigator.vibrate(ms);}catch(e){} };
 
+  // -------- 触控 UI --------
   const lanes = $('#lanes');
   const laneDivs = $$('.lane');
 
@@ -108,8 +107,7 @@
     const rect = lanes.getBoundingClientRect();
     if (clientY < rect.top || clientY > rect.bottom) return -1;
     const y = clientY - rect.top;
-    const h = rect.height;
-    const idx = Math.floor(y / (h / laneDivs.length));
+    const idx = Math.floor(y / (rect.height / laneDivs.length));
     return clamp(idx,0,laneDivs.length-1);
   }
   function setActiveLane(i){
@@ -119,43 +117,43 @@
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.add('active');
   }
 
-  // ---- 关键修复：手势发生时立即触发切分 ----
-  function markHint(type){
+  function onGesture(){
+    // 手势到来即切分上一段
     if (!isRecording || !ctx) return;
     const t = ctx.currentTime;
-    hintEvents.push({t, type});
-    ensureBoundary(t);           // ★ 新增：把手势作为强边界
-    if (type==='start' || type==='change' || type==='stop') vib(8);
+    ensureBoundary(t);
+    vib(8);
   }
 
-  lanes.addEventListener('touchstart', (e)=>{
-    e.preventDefault();
+  lanes.addEventListener('touchstart', (e)=>{ e.preventDefault();
     const i = laneFromTouch(e.touches[0].clientY);
-    if (i>=0){ setActiveLane(i); markHint('start'); }
+    if (i>=0){ setActiveLane(i); onGesture(); }
   }, {passive:false});
-  lanes.addEventListener('touchmove', (e)=>{
-    e.preventDefault();
+  lanes.addEventListener('touchmove', (e)=>{ e.preventDefault();
     const i = laneFromTouch(e.touches[0].clientY);
-    if (i>=0 && i!==laneActive){ setActiveLane(i); markHint('change'); }
-    if (i<0 && laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+    if (i>=0 && i!==laneActive){ setActiveLane(i); onGesture(); }
+    if (i<0 && laneActive!=null){ setActiveLane(-1); onGesture(); }
   }, {passive:false});
-  lanes.addEventListener('touchend', (e)=>{
-    e.preventDefault();
-    setActiveLane(-1); markHint('stop');
-  }, {passive:false});
+  lanes.addEventListener('touchend', (e)=>{ e.preventDefault(); setActiveLane(-1); onGesture(); }, {passive:false});
 
   lanes.addEventListener('mousedown', (e)=>{
     const i = laneFromTouch(e.clientY);
-    if (i>=0){ setActiveLane(i); markHint('start'); }
+    if (i>=0){ setActiveLane(i); onGesture(); }
   });
   lanes.addEventListener('mousemove', (e)=>{
     if (e.buttons!==1) return;
     const i = laneFromTouch(e.clientY);
-    if (i>=0 && i!==laneActive){ setActiveLane(i); markHint('change'); }
-    if (i<0 && laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+    if (i>=0 && i!==laneActive){ setActiveLane(i); onGesture(); }
+    if (i<0 && laneActive!=null){ setActiveLane(-1); onGesture(); }
   });
   window.addEventListener('mouseup', ()=>{
-    if (laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+    if (laneActive!=null){ setActiveLane(-1); onGesture(); }
+  });
+
+  // -------- 录制开关（合并成一个按钮） --------
+  $('#btnRec').addEventListener('click', async ()=>{
+    if (!isRecording) await startRecording();
+    else stopRecording();
   });
 
   async function startRecording(){
@@ -169,80 +167,102 @@
     micStream = await navigator.mediaDevices.getUserMedia({audio:{
       echoCancellation:false, noiseSuppression:false, autoGainControl:false
     }});
-
     const src = ctx.createMediaStreamSource(micStream);
 
-    const bufSize = frameSize;
-    $('#buf').textContent = bufSize;
-    procNode = (ctx.createScriptProcessor||ctx.createJavaScriptNode).call(ctx, bufSize, 1, 1);
+    // 让处理节点“静音连接”，避免回声同时保证 onaudioprocess 触发
+    procNode = (ctx.createScriptProcessor||ctx.createJavaScriptNode).call(ctx, 2048, 1, 1);
     procNode.onaudioprocess = e=>{
       const input = e.inputBuffer.getChannelData(0);
       const tCtx = ctx.currentTime;
       processFrame(input, tCtx);
     };
-
+    zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
     analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
 
     src.connect(procNode);
     src.connect(analyser);
-    procNode.connect(ctx.destination);
+    procNode.connect(zeroGain); zeroGain.connect(ctx.destination);
 
+    // 状态复位
     isRecording = true;
     t0Ctx = ctx.currentTime;
-    pitchBuf.length = 0; hintEvents.length = 0; notes.length = 0;
-    lastBoundary = null; lastAutoMid = null; lastAutoTime = null;
+    pitchBuf.length = 0; notes.length = 0;
+    lastBoundary = null; lastF0 = 0; silenceSince = null;
     $('#cnt').textContent = '0';
     $('#noteList').hidden = true;
 
-    $('#btnInit').disabled = true;
-    $('#btnStop').disabled = false;
-    $('#btnPlay').disabled = true;
-    $('#btnExport').disabled = true;
+    // UI
+    const b = $('#btnRec');
+    b.textContent = '停止';
+    b.classList.remove('primary');
+    b.classList.add('recOn');
+
+    updateButtons();
   }
 
   function stopRecording(){
     isRecording = false;
     try{ procNode.disconnect(); }catch(e){}
     try{ analyser.disconnect(); }catch(e){}
+    try{ zeroGain.disconnect(); }catch(e){}
     try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
 
-    finalizeAll();
+    finalizeAll();   // 收尾切分 + 兜底
     renderNoteList();
+    updateButtons();
 
-    $('#btnInit').disabled = false;
-    $('#btnStop').disabled = true;
-    $('#btnPlay').disabled = notes.length===0;
-    $('#btnExport').disabled = notes.length===0;
+    // UI
+    const b = $('#btnRec');
+    b.textContent = '开始录制';
+    b.classList.remove('recOn');
+    b.classList.add('primary');
   }
 
-  // --- 基频估计：简化 ACF ---
+  function updateButtons(){
+    const has = notes.length>0;
+    $('#btnPlay').disabled = !has;
+    $('#btnExport').disabled = !has;
+  }
+
+  // -------- 基频估计（带窗函数的简化 ACF） --------
   function estimateF0ACF(frame, sr){
-    let sum = 0; for (let i=0;i<frame.length;i++){ const s=frame[i]; sum += s*s; }
-    const energy = sum / frame.length;
+    const N = frame.length;
+    // Hann 窗 + 去直流
+    let mean=0; for (let i=0;i<N;i++) mean+=frame[i]; mean/=N;
+    const w = Math.PI*2/(N-1);
+    let energy=0; const x = new Float32Array(N);
+    for (let i=0;i<N;i++){ const s=(frame[i]-mean)*(0.5-0.5*Math.cos(w*i)); x[i]=s; energy+=s*s; }
+    energy/=N;
     if (energy < ENERGY_TH) return null;
 
     const minLag = Math.floor(sr / MAX_F);
     const maxLag = Math.floor(sr / MIN_F);
-    let bestLag = -1, bestCorr = 0;
-
+    let bestLag = -1, best = 0;
     for (let lag=minLag; lag<=maxLag; lag++){
-      let corr = 0;
-      for (let i=0; i<frame.length-lag; i++){
-        corr += frame[i]*frame[i+lag];
-      }
-      corr /= (frame.length-lag);
-      if (corr > bestCorr){ bestCorr = corr; bestLag = lag; }
+      let c=0;
+      for (let i=0; i<N-lag; i++) c += x[i]*x[i+lag];
+      c/= (N-lag);
+      if (c>best){ best=c; bestLag=lag; }
     }
-    if (bestLag < 0) return null;
-    const f0 = sr / bestLag;
-    return {f0, amp: Math.sqrt(energy)};
+    if (bestLag<0) return null;
+    return {f0: sr/bestLag, amp: Math.sqrt(energy)};
   }
+
+  // -------- 处理与切分 --------
+  let lastBoundary = null;
+  let lastF0 = 0;
+  let silenceSince = null;
 
   function processFrame(input, tCtx){
     const est = estimateF0ACF(input, sampleRate);
-    if (est){ pitchBuf.push({t: tCtx, f0: est.f0, amp: est.amp}); }
-    else{ pitchBuf.push({t: tCtx, f0: 0, amp: 0}); }
-    autoBoundary();
+    if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); lastF0 = est.f0; silenceSince = null; }
+    else{ pitchBuf.push({t:tCtx, f0:0, amp:0}); if (silenceSince==null) silenceSince = tCtx; }
+
+    // 无手势情况下的自动停音
+    if (silenceSince!=null && (tCtx - silenceSince) > RELEASE_GAP && isRecording){
+      ensureBoundary(tCtx);
+      silenceSince = null;
+    }
   }
 
   function sliceByTime(tStart, tEnd){
@@ -251,17 +271,18 @@
     const fs = seg.map(p=>p.f0).sort((a,b)=>a-b);
     const fMed = fs[fs.length>>1];
     const midi = Math.round(freq2midi(fMed));
-    const freqQ = midi2freq(midi);
-    const ok = seg.filter(p=>Math.abs(cents(p.f0, freqQ))<100).length / seg.length > 0.5;
+    const fq = midi2freq(midi);
+    // 放宽一致性：>40% 的点落在 ±120 cents 视为可接受
+    const ok = seg.filter(p=>Math.abs(cents(p.f0, fq))<120).length / seg.length > 0.4;
     if (!ok) return null;
-    return {midi, freq:freqQ};
+    return {midi, freq:fq};
   }
 
-  let lastBoundary = null;
   function ensureBoundary(t){
     if (!isRecording) return;
     if (lastBoundary==null) lastBoundary = t0Ctx;
-    if ((t - lastBoundary) * 1000 < MIN_NOTE_MS){ lastBoundary = t; return; }
+    // 去抖
+    if ((t - lastBoundary)*1000 < MIN_NOTE_MS){ lastBoundary = t; return; }
     const seg = sliceByTime(lastBoundary, t);
     if (seg){
       const start = lastBoundary;
@@ -272,40 +293,34 @@
     lastBoundary = t;
   }
 
-  let lastAutoMid = null, lastAutoTime = null;
-  function autoBoundary(){
-    if (pitchBuf.length<3) return;
-    const p = pitchBuf[pitchBuf.length-1];
-    if (p.f0<=0){
-      if (lastAutoTime && (p.t - lastAutoTime)>RELEASE_GAP && isRecording){
-        ensureBoundary(p.t);
-        lastAutoMid = null; lastAutoTime = null;
-      }
-      return;
-    }
-    const m = freq2midi(p.f0);
-    if (lastAutoMid==null){ lastAutoMid=m; lastAutoTime=p.t; return; }
-    if (Math.abs(m - lastAutoMid) >= 0.8){
-      ensureBoundary(p.t);
-      lastAutoMid = m; lastAutoTime = p.t;
-    }
-  }
-
   function finalizeAll(){
     const tEnd = (pitchBuf.length? pitchBuf[pitchBuf.length-1].t : (ctx?ctx.currentTime:0));
     if (lastBoundary==null) lastBoundary = t0Ctx;
+
     if ((tEnd - lastBoundary)*1000 >= MIN_NOTE_MS){
       const seg = sliceByTime(lastBoundary, tEnd);
-      if (seg){ notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary}); }
+      if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
     }
+    // 兜底：若仍为空但存在可用 f0，合成一段
+    if (notes.length===0){
+      const any = pitchBuf.find(p=>p.f0>0);
+      if (any){
+        const midi = Math.round(freq2midi(any.f0));
+        const start = t0Ctx, dur = Math.max(0.2, tEnd - t0Ctx);
+        notes.push({midi, start, dur});
+      }
+    }
+    // 归一化到 0
     const t0 = notes.length? notes[0].start : 0;
     notes.forEach(n=>{ n.start -= t0; });
     $('#cnt').textContent = String(notes.length);
   }
 
-  function playNotes(bpm=120){
-    if (!notes.length) return;
+  // -------- 播放 --------
+  $('#btnPlay').addEventListener('click', ()=>{
+    if (!notes.length){ return; }
     if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume();
     const tStart = ctx.currentTime + 0.05;
     const A=0.0005, D=0.01, S=0.15, R=0.08;
     const master = ctx.createGain(); master.gain.value = 0.6; master.connect(ctx.destination);
@@ -320,9 +335,10 @@
       g.gain.linearRampToValueAtTime(0, t+d);
       o.start(t); o.stop(t+d+0.02);
     });
-  }
+  });
 
-  function exportMIDI(filename='humming.mid'){
+  // -------- 导出 MIDI --------
+  $('#btnExport').addEventListener('click', ()=>{
     if (!notes.length) return;
     const PPQ=480, BPM=120;
     const microPerQN = Math.round(60000000/BPM);
@@ -356,11 +372,14 @@
     const trackHeader = [0x4d,0x54,0x72,0x6b, (len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF];
     const bytes = new Uint8Array(header.length + trackHeader.length + len);
     bytes.set(header,0); bytes.set(trackHeader,header.length); bytes.set(track,header.length+trackHeader.length);
-    const blob = new Blob([bytes], {type:'audio/midi'});
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
-    URL.revokeObjectURL(a.href);
-  }
 
+    const blob = new Blob([bytes], {type:'application/octet-stream'}); // 对 Safari 更稳
+    const a = document.createElement('a'); a.style.display='none';
+    a.href = URL.createObjectURL(blob); a.download = 'humming.mid';
+    document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  });
+
+  // -------- 列表 --------
   function renderNoteList(){
     const box = $('#noteList');
     if (!notes.length){ box.hidden=true; return; }
@@ -373,11 +392,6 @@
     box.textContent = rows;
     box.hidden = false;
   }
-
-  $('#btnInit').addEventListener('click', startRecording);
-  $('#btnStop').addEventListener('click', stopRecording);
-  $('#btnPlay').addEventListener('click', ()=>playNotes(120));
-  $('#btnExport').addEventListener('click', exportMIDI);
 })();
 </script>
 </body>
