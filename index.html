@@ -6,9 +6,8 @@
 <title>哼唱→旋律（手势辅助）</title>
 <style>
   :root{
-    --lane-a:#1e5bff;
-    --lane-b:#66c8ff;
-    --lane-active-filter: brightness(1.25) saturate(1.1);
+    --lane-a:#1e5bff;  /* 深蓝 */
+    --lane-b:#66c8ff;  /* 浅蓝 */
     --bg:#ffffff;
     --ui:#0f172a;
     --muted:#64748b;
@@ -22,12 +21,18 @@
   button:disabled{opacity:.5}
   .stat{font-size:13px;color:var(--muted);margin-left:auto}
   #lanes{flex:1;touch-action:none;position:relative;overflow:hidden}
-  .lane{position:relative;height:14.2857%; /* 7条 */
-        transition:filter .06s ease; user-select:none;}
+  .lane{
+    position:relative;height:14.2857%; user-select:none;
+  }
   .lane:nth-child(odd){background:var(--lane-a)}
   .lane:nth-child(even){background:var(--lane-b)}
-  .lane.active{filter:var(--lane-active-filter)}
-  .gutter{position:absolute;inset:auto 0 0 0;height:0} /* 占位，便于判断“划向空白” */
+  /* 修复点：用 overlay 叠加“变浅”，避免 Safari 对 filter 的刷新问题 */
+  .lane::after{
+    content:""; position:absolute; inset:0; background:rgba(255,255,255,0);
+    transition:background .06s ease;
+  }
+  .lane.active::after{ background:rgba(255,255,255,0.22); }
+  .gutter{position:absolute;inset:auto 0 0 0;height:0}
   footer{border-top:1px solid #e2e8f0;padding:8px 14px;font-size:13px;color:var(--muted)}
   .chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:8px}
   .chip{font-size:12px;border:1px dashed #cbd5e1;border-radius:999px;padding:4px 8px}
@@ -52,7 +57,6 @@
   </header>
 
   <div id="lanes" aria-label="gesture lanes">
-    <!-- 7条色块（按需求可改数量） -->
     <div class="lane" data-i="0"></div>
     <div class="lane" data-i="1"></div>
     <div class="lane" data-i="2"></div>
@@ -69,44 +73,34 @@
 
 <script>
 (() => {
-  // ---------- 简易工具 ----------
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
   const clamp = (x,min,max)=>Math.max(min,Math.min(max,x));
-  const nowMs = ()=>performance.now();
   const midi2freq = m => 440 * Math.pow(2,(m-69)/12);
   const freq2midi = f => 69 + 12 * Math.log2(f/440);
   const cents = (f1,f2)=>1200*Math.log2(f1/f2);
 
-  // ---------- 运行状态 ----------
   let ctx, micStream, procNode, analyser;
   let sampleRate = 48000;
-  let frameSize = 2048;          // ScriptProcessorNode bufferSize
-  let hop = 1024;                // 分析步进
+  let frameSize = 2048, hop = 1024;
   let isRecording = false;
-  let t0Ctx = 0;                 // ctx.currentTime 作为时间基
-  let laneActive = null;         // 当前触控所在 lane 下标
+  let t0Ctx = 0;
+  let laneActive = null;
 
-  // 音高采样缓存：{t, f0, amp}
-  const pitchBuf = [];
-  // 手势事件：{t, type:'start'|'change'|'stop'}
-  const hintEvents = [];
-  // 旋律片段（最终）：{midi, start, dur}
-  const notes = [];
+  const pitchBuf = [];           // {t,f0,amp}
+  const hintEvents = [];         // {t,type}
+  const notes = [];              // {midi,start,dur}
 
-  // 参数
-  const MIN_F = 80, MAX_F = 1000;     // 人声常见范围
-  const ENERGY_TH = 0.01;             // 静音门限（均方）
-  const MIN_NOTE_MS = 80;             // 最小切分时长（去抖保护）
-  const ALIGN_WIN = 0.18;             // 触控与音频对齐窗口（秒）
-  const RELEASE_GAP = 0.12;           // 估计停音的最小空白（秒）
+  const MIN_F = 80, MAX_F = 1000;
+  const ENERGY_TH = 0.004;       // 略放宽，提升拾音稳定度
+  const MIN_NOTE_MS = 80;
+  const ALIGN_WIN = 0.18;
+  const RELEASE_GAP = 0.12;
 
-  // ---------- 震动 ----------
   const vibrateOK = 'vibrate' in navigator;
   $('#vibChip').textContent = `Vibrate: ${vibrateOK ? 'on' : 'off'}`;
   const vib = ms => { if (vibrateOK) try { navigator.vibrate(ms); } catch(e){} };
 
-  // ---------- UI：色块交互 ----------
   const lanes = $('#lanes');
   const laneDivs = $$('.lane');
 
@@ -118,7 +112,6 @@
     const idx = Math.floor(y / (h / laneDivs.length));
     return clamp(idx,0,laneDivs.length-1);
   }
-
   function setActiveLane(i){
     if (laneActive === i) return;
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.remove('active');
@@ -126,34 +119,31 @@
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.add('active');
   }
 
+  // ---- 关键修复：手势发生时立即触发切分 ----
   function markHint(type){
     if (!isRecording || !ctx) return;
     const t = ctx.currentTime;
     hintEvents.push({t, type});
-    // 轻触反馈（若支持）
+    ensureBoundary(t);           // ★ 新增：把手势作为强边界
     if (type==='start' || type==='change' || type==='stop') vib(8);
   }
 
-  // 触摸事件（移动端主路径）
   lanes.addEventListener('touchstart', (e)=>{
     e.preventDefault();
     const i = laneFromTouch(e.touches[0].clientY);
     if (i>=0){ setActiveLane(i); markHint('start'); }
   }, {passive:false});
-
   lanes.addEventListener('touchmove', (e)=>{
     e.preventDefault();
     const i = laneFromTouch(e.touches[0].clientY);
     if (i>=0 && i!==laneActive){ setActiveLane(i); markHint('change'); }
     if (i<0 && laneActive!=null){ setActiveLane(-1); markHint('stop'); }
   }, {passive:false});
-
   lanes.addEventListener('touchend', (e)=>{
     e.preventDefault();
     setActiveLane(-1); markHint('stop');
   }, {passive:false});
 
-  // 同步支持鼠标（桌面调试）
   lanes.addEventListener('mousedown', (e)=>{
     const i = laneFromTouch(e.clientY);
     if (i>=0){ setActiveLane(i); markHint('start'); }
@@ -168,7 +158,6 @@
     if (laneActive!=null){ setActiveLane(-1); markHint('stop'); }
   });
 
-  // ---------- 音频初始化 ----------
   async function startRecording(){
     if (!ctx){
       ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -183,30 +172,25 @@
 
     const src = ctx.createMediaStreamSource(micStream);
 
-    // ScriptProcessor 兼容路径（Safari 仍支持）
     const bufSize = frameSize;
     $('#buf').textContent = bufSize;
     procNode = (ctx.createScriptProcessor||ctx.createJavaScriptNode).call(ctx, bufSize, 1, 1);
     procNode.onaudioprocess = e=>{
       const input = e.inputBuffer.getChannelData(0);
-      const tCtx = ctx.currentTime; // 近似帧时刻
+      const tCtx = ctx.currentTime;
       processFrame(input, tCtx);
     };
 
-    // 可选：能量参考（非必须）
-    analyser = ctx.createAnalyser();
-    analyser.fftSize = 1024;
+    analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
 
     src.connect(procNode);
     src.connect(analyser);
-    procNode.connect(ctx.destination); // 处理节点需要连接到 graph 才会触发
+    procNode.connect(ctx.destination);
 
-    // 置状态
     isRecording = true;
     t0Ctx = ctx.currentTime;
-    pitchBuf.length = 0;
-    hintEvents.length = 0;
-    notes.length = 0;
+    pitchBuf.length = 0; hintEvents.length = 0; notes.length = 0;
+    lastBoundary = null; lastAutoMid = null; lastAutoTime = null;
     $('#cnt').textContent = '0';
     $('#noteList').hidden = true;
 
@@ -222,7 +206,6 @@
     try{ analyser.disconnect(); }catch(e){}
     try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
 
-    // 根据收集数据生成音符
     finalizeAll();
     renderNoteList();
 
@@ -232,78 +215,53 @@
     $('#btnExport').disabled = notes.length===0;
   }
 
-  // ---------- 基频估计（自相关简化版） ----------
-  // 返回 {f0, amp}；无可靠峰返回 null
+  // --- 基频估计：简化 ACF ---
   function estimateF0ACF(frame, sr){
-    // 预加权 + 能量
     let sum = 0; for (let i=0;i<frame.length;i++){ const s=frame[i]; sum += s*s; }
     const energy = sum / frame.length;
     if (energy < ENERGY_TH) return null;
 
-    // 自相关（限制滞后范围以加速）
     const minLag = Math.floor(sr / MAX_F);
     const maxLag = Math.floor(sr / MIN_F);
     let bestLag = -1, bestCorr = 0;
 
-    // 归一化 ACF （简化）
     for (let lag=minLag; lag<=maxLag; lag++){
       let corr = 0;
       for (let i=0; i<frame.length-lag; i++){
         corr += frame[i]*frame[i+lag];
       }
-      // 近似归一化
       corr /= (frame.length-lag);
-      if (corr > bestCorr){
-        bestCorr = corr; bestLag = lag;
-      }
+      if (corr > bestCorr){ bestCorr = corr; bestLag = lag; }
     }
     if (bestLag < 0) return null;
-
     const f0 = sr / bestLag;
     return {f0, amp: Math.sqrt(energy)};
   }
 
   function processFrame(input, tCtx){
-    // 为减小花销，使用跳步重采样
-    // 叠加缓冲：这里直接以传入帧估计（足够演示）
     const est = estimateF0ACF(input, sampleRate);
-    if (est){
-      pitchBuf.push({t: tCtx, f0: est.f0, amp: est.amp});
-    }else{
-      pitchBuf.push({t: tCtx, f0: 0, amp: 0});
-    }
-
-    // 若长时间无 hint，也尝试基于“明显变调”自切分（软）
+    if (est){ pitchBuf.push({t: tCtx, f0: est.f0, amp: est.amp}); }
+    else{ pitchBuf.push({t: tCtx, f0: 0, amp: 0}); }
     autoBoundary();
   }
 
-  // ---------- 融合：手势边界 + 基频缓存 ----------
   function sliceByTime(tStart, tEnd){
-    // 抓取 [tStart, tEnd) 的采样
     const seg = pitchBuf.filter(p => p.t>=tStart && p.t<tEnd && p.f0>0);
     if (seg.length===0) return null;
-
-    // 取中位数频率，稳健抗抖
     const fs = seg.map(p=>p.f0).sort((a,b)=>a-b);
     const fMed = fs[fs.length>>1];
-
-    // 半音量化
     const midi = Math.round(freq2midi(fMed));
     const freqQ = midi2freq(midi);
-
-    // 若漂移过大（>100 cents）视为不可靠
     const ok = seg.filter(p=>Math.abs(cents(p.f0, freqQ))<100).length / seg.length > 0.5;
     if (!ok) return null;
-
     return {midi, freq:freqQ};
   }
 
-  // 根据 hintEvents 即时切分
-  let lastBoundary = null;  // ctxTime
+  let lastBoundary = null;
   function ensureBoundary(t){
+    if (!isRecording) return;
     if (lastBoundary==null) lastBoundary = t0Ctx;
-    // 时间过短不切分（去抖）
-    if ((t - lastBoundary) * 1000 < MIN_NOTE_MS) { lastBoundary = t; return; }
+    if ((t - lastBoundary) * 1000 < MIN_NOTE_MS){ lastBoundary = t; return; }
     const seg = sliceByTime(lastBoundary, t);
     if (seg){
       const start = lastBoundary;
@@ -314,12 +272,11 @@
     lastBoundary = t;
   }
 
-  // 自动边界：当音高跳变明显时（无手势也切）
   let lastAutoMid = null, lastAutoTime = null;
   function autoBoundary(){
     if (pitchBuf.length<3) return;
     const p = pitchBuf[pitchBuf.length-1];
-    if (p.f0<=0){ // 进入空白：若空白超阈，触发收音
+    if (p.f0<=0){
       if (lastAutoTime && (p.t - lastAutoTime)>RELEASE_GAP && isRecording){
         ensureBoundary(p.t);
         lastAutoMid = null; lastAutoTime = null;
@@ -328,65 +285,48 @@
     }
     const m = freq2midi(p.f0);
     if (lastAutoMid==null){ lastAutoMid=m; lastAutoTime=p.t; return; }
-    if (Math.abs(m - lastAutoMid) >= 0.8){ // 约等于 > 1 个半音的跳变
+    if (Math.abs(m - lastAutoMid) >= 0.8){
       ensureBoundary(p.t);
       lastAutoMid = m; lastAutoTime = p.t;
     }
   }
 
-  // 停止后收尾：按最后边界到结束时间切一次
   function finalizeAll(){
-    const tEnd = (pitchBuf.length? pitchBuf[pitchBuf.length-1].t : ctx.currentTime || 0);
+    const tEnd = (pitchBuf.length? pitchBuf[pitchBuf.length-1].t : (ctx?ctx.currentTime:0));
     if (lastBoundary==null) lastBoundary = t0Ctx;
     if ((tEnd - lastBoundary)*1000 >= MIN_NOTE_MS){
       const seg = sliceByTime(lastBoundary, tEnd);
-      if (seg){
-        notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
-        $('#cnt').textContent = String(notes.length);
-      }
+      if (seg){ notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary}); }
     }
-    // 归一化到相对时间 0
     const t0 = notes.length? notes[0].start : 0;
     notes.forEach(n=>{ n.start -= t0; });
+    $('#cnt').textContent = String(notes.length);
   }
 
-  // ---------- 回放 ----------
   function playNotes(bpm=120){
+    if (!notes.length) return;
     if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
     const tStart = ctx.currentTime + 0.05;
-    const A=0.0005, D=0.01, S=0.15, R=0.08; // 简单包络
+    const A=0.0005, D=0.01, S=0.15, R=0.08;
     const master = ctx.createGain(); master.gain.value = 0.6; master.connect(ctx.destination);
-
     notes.forEach(n=>{
-      const o=ctx.createOscillator();
-      o.type='sine'; o.frequency.value = midi2freq(n.midi);
-
-      const g=ctx.createGain(); g.gain.value=0;
-      o.connect(g); g.connect(master);
-
-      const t = tStart + n.start;
-      const d = Math.max(0.03, n.dur);
-      // ADSR
+      const o=ctx.createOscillator(); o.type='sine'; o.frequency.value = midi2freq(n.midi);
+      const g=ctx.createGain(); g.gain.value=0; o.connect(g); g.connect(master);
+      const t = tStart + n.start; const d = Math.max(0.03, n.dur);
       g.gain.setValueAtTime(0, t);
       g.gain.linearRampToValueAtTime(1.0, t+A);
       g.gain.linearRampToValueAtTime(S, t+A+D);
       g.gain.setValueAtTime(S, t+d-R);
       g.gain.linearRampToValueAtTime(0, t+d);
-
-      o.start(t);
-      o.stop(t+d+0.02);
+      o.start(t); o.stop(t+d+0.02);
     });
   }
 
-  // ---------- 导出 MIDI ----------
   function exportMIDI(filename='humming.mid'){
-    // Type0, PPQ=480, tempo=120bpm
+    if (!notes.length) return;
     const PPQ=480, BPM=120;
     const microPerQN = Math.round(60000000/BPM);
-
-    // 计算 delta-ticks
     const events = [];
-    let lastTick = 0;
     notes.forEach(n=>{
       const tickOn = Math.round(n.start * (PPQ*BPM/60));
       const tickOff = Math.round((n.start+n.dur) * (PPQ*BPM/60));
@@ -395,56 +335,32 @@
       events.push({tick:tickOff, type:0x80, key, vel:0});
     });
     events.sort((a,b)=>a.tick-b.tick);
-
-    function vlq(n){ // 可变长
-      const bytes=[];
-      let buffer = n & 0x7F;
-      while((n >>= 7)){
-        buffer <<= 8; buffer |= ((n & 0x7F) | 0x80);
-      }
-      while(true){
-        bytes.push(buffer & 0xFF);
-        if (buffer & 0x80) buffer >>= 8; else break;
-      }
-      return bytes;
-    }
+    function vlq(n){ const bytes=[]; let buffer = n & 0x7F;
+      while((n >>= 7)){ buffer <<= 8; buffer |= ((n & 0x7F) | 0x80); }
+      while(true){ bytes.push(buffer & 0xFF); if (buffer & 0x80) buffer >>= 8; else break; }
+      return bytes; }
     function push(arr,...xs){ xs.forEach(x=>arr.push(x&0xFF)); }
 
-    // Header
     const header = [];
     push(header, 0x4d,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01,  (PPQ>>8)&0xFF, PPQ&0xFF);
-
-    // Track
     let track = [];
-    // Set Tempo
     track.push(0x00, 0xff, 0x51, 0x03, (microPerQN>>16)&0xFF, (microPerQN>>8)&0xFF, microPerQN&0xFF);
-    // Program Change (Acoustic Grand)
     track.push(0x00, 0xC0, 0x00);
-
     let prevTick = 0;
     events.forEach(ev=>{
       const dt = ev.tick - prevTick; prevTick = ev.tick;
       track.push(...vlq(dt), ev.type, ev.key, ev.vel);
     });
-    // End of Track
     track.push(0x00, 0xff, 0x2f, 0x00);
-
-    // Track chunk header
     const len = track.length;
     const trackHeader = [0x4d,0x54,0x72,0x6b, (len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF];
-
     const bytes = new Uint8Array(header.length + trackHeader.length + len);
     bytes.set(header,0); bytes.set(trackHeader,header.length); bytes.set(track,header.length+trackHeader.length);
-
     const blob = new Blob([bytes], {type:'audio/midi'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
     URL.revokeObjectURL(a.href);
   }
 
-  // ---------- 列表展示 ----------
   function renderNoteList(){
     const box = $('#noteList');
     if (!notes.length){ box.hidden=true; return; }
@@ -458,12 +374,10 @@
     box.hidden = false;
   }
 
-  // ---------- 绑定按钮 ----------
   $('#btnInit').addEventListener('click', startRecording);
   $('#btnStop').addEventListener('click', stopRecording);
   $('#btnPlay').addEventListener('click', ()=>playNotes(120));
   $('#btnExport').addEventListener('click', exportMIDI);
-
 })();
 </script>
 </body>
