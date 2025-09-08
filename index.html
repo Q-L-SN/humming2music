@@ -1,294 +1,470 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>哼唱转音乐</title>
-  <style>
-    :root { --bg:#0f0f12; --fg:#f2f3f5; --muted:#9aa0a6; --acc:#3e8ef7; --card:#17181c; }
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Arial,sans-serif;}
-    .wrap{max-width:720px;margin:0 auto;padding:16px 16px 80px;}
-    h1{font-size:20px;margin:8px 0 12px;}
-    .panel{background:var(--card);border-radius:12px;padding:14px;margin:12px 0;}
-    .bigbtn{display:block;width:100%;padding:16px;border-radius:14px;border:none;background:var(--acc);color:#fff;font-weight:700;font-size:18px;}
-    .bigbtn[aria-pressed="true"]{background:#d64545;}
-    .note{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.4;}
-    ul#tracks{list-style:none;margin:0;padding:0;display:grid;gap:10px;}
-    .track{display:flex;align-items:center;gap:10px;background:var(--card);padding:10px 12px;border-radius:12px}
-    .play{width:40px;height:40px;border-radius:10px;border:1px solid #2d2f36;background:#1f2126;color:#fff;font-size:16px}
-    .meta{flex:1;min-width:0}
-    .title{font-weight:600;font-size:14px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
-    .sub{color:var(--muted);font-size:12px}
-    .actions{display:flex;gap:8px}
-    .actions a,.actions button{background:#1f2126;border:1px solid #2d2f36;color:#fff;border-radius:10px;padding:8px 10px;font-size:12px;text-decoration:none}
-    audio{display:none}
-    .busy{opacity:.6;pointer-events:none;filter:grayscale(.1)}
-    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1f2126;border:1px solid #2d2f36;color:#d0d3d8;font-size:12px;margin-right:6px}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>哼唱→旋律（手势辅助）</title>
+<style>
+  :root{
+    --lane-a:#1e5bff;
+    --lane-b:#66c8ff;
+    --lane-active-filter: brightness(1.25) saturate(1.1);
+    --bg:#ffffff;
+    --ui:#0f172a;
+    --muted:#64748b;
+    --brand:#0ea5e9;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ui);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+  .wrap{display:flex;flex-direction:column;height:100%;max-width:900px;margin:0 auto;}
+  header{padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;position:sticky;top:0;background:rgba(255,255,255,.85);backdrop-filter:saturate(1.2) blur(6px);z-index:3}
+  button,select,input{appearance:none;border:1px solid #cbd5e1;border-radius:12px;padding:10px 14px;background:#fff;color:var(--ui);font-size:15px}
+  button.primary{background:var(--brand);color:#fff;border-color:var(--brand)}
+  button:disabled{opacity:.5}
+  .stat{font-size:13px;color:var(--muted);margin-left:auto}
+  #lanes{flex:1;touch-action:none;position:relative;overflow:hidden}
+  .lane{position:relative;height:14.2857%; /* 7条 */
+        transition:filter .06s ease; user-select:none;}
+  .lane:nth-child(odd){background:var(--lane-a)}
+  .lane:nth-child(even){background:var(--lane-b)}
+  .lane.active{filter:var(--lane-active-filter)}
+  .gutter{position:absolute;inset:auto 0 0 0;height:0} /* 占位，便于判断“划向空白” */
+  footer{border-top:1px solid #e2e8f0;padding:8px 14px;font-size:13px;color:var(--muted)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:8px}
+  .chip{font-size:12px;border:1px dashed #cbd5e1;border-radius:999px;padding:4px 8px}
+  .list{padding:8px 14px;font-size:13px;max-height:28vh;overflow:auto;border-top:1px solid #e2e8f0}
+  .mono{font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>哼唱转音乐</h1>
-
-    <div class="panel">
-      <div class="note">
-        <span class="pill"><strong>窗宽</strong> 40 ms</span>
-        <span class="pill"><strong>覆盖率</strong> 0.85</span>
-        <span class="pill"><strong>最短片段</strong> 80 ms</span>
-        <span class="pill"><strong>频率</strong> 70–1000 Hz</span>
-      </div>
+<div class="wrap">
+  <header>
+    <button id="btnInit" class="primary">启用麦克风 / 开始录制</button>
+    <button id="btnStop" disabled>停止</button>
+    <button id="btnPlay" disabled>播放旋律</button>
+    <button id="btnExport" disabled>导出 MIDI</button>
+    <label class="chips"><span class="chip">A4=440</span>
+      <span class="chip">Semitone quantize</span>
+      <span id="vibChip" class="chip">Vibrate: auto</span>
+    </label>
+    <div class="stat">
+      采样<span id="sr">-</span>Hz · 帧<span id="buf">-</span> · 片段<span id="cnt">0</span>
     </div>
+  </header>
 
-    <div class="panel">
-      <button id="recBtn" class="bigbtn" aria-pressed="false">开始录制</button>
-      <div class="note" id="status">就绪</div>
-    </div>
-
-    <div class="panel">
-      <div style="margin-bottom:8px;font-weight:700">已生成音乐</div>
-      <ul id="tracks"></ul>
-      <div class="note">单击条目播放/暂停；点“导出WAV”保存处理后的音乐。</div>
-    </div>
+  <div id="lanes" aria-label="gesture lanes">
+    <!-- 7条色块（按需求可改数量） -->
+    <div class="lane" data-i="0"></div>
+    <div class="lane" data-i="1"></div>
+    <div class="lane" data-i="2"></div>
+    <div class="lane" data-i="3"></div>
+    <div class="lane" data-i="4"></div>
+    <div class="lane" data-i="5"></div>
+    <div class="lane" data-i="6"></div>
+    <div class="gutter"></div>
   </div>
 
-  <script type="module">
-    import * as Tone from 'https://esm.sh/tone@14.8.49';
-    import { YIN } from 'https://esm.sh/pitchfinder@2.3.2';
-    import toWav from 'https://esm.sh/audiobuffer-to-wav@1.0.0';
+  <div class="list mono" id="noteList" hidden></div>
+  <footer>提示：按住或划入色块表示**起音/换音**，抬手或划出表示**停音**；色块只作提示，不对应具体音高。</footer>
+</div>
 
-    // —— 固定参数（最佳实践） ——
-    const PARAMS = {
-      windowMs: 40,          // 窗宽
-      overlap: 0.85,         // 覆盖率（步长≈6ms）
-      minDurSec: 0.08,       // 最短片段
-      minFreq: 70,           // 频率范围
-      maxFreq: 1000
+<script>
+(() => {
+  // ---------- 简易工具 ----------
+  const $ = s => document.querySelector(s);
+  const $$ = s => Array.from(document.querySelectorAll(s));
+  const clamp = (x,min,max)=>Math.max(min,Math.min(max,x));
+  const nowMs = ()=>performance.now();
+  const midi2freq = m => 440 * Math.pow(2,(m-69)/12);
+  const freq2midi = f => 69 + 12 * Math.log2(f/440);
+  const cents = (f1,f2)=>1200*Math.log2(f1/f2);
+
+  // ---------- 运行状态 ----------
+  let ctx, micStream, procNode, analyser;
+  let sampleRate = 48000;
+  let frameSize = 2048;          // ScriptProcessorNode bufferSize
+  let hop = 1024;                // 分析步进
+  let isRecording = false;
+  let t0Ctx = 0;                 // ctx.currentTime 作为时间基
+  let laneActive = null;         // 当前触控所在 lane 下标
+
+  // 音高采样缓存：{t, f0, amp}
+  const pitchBuf = [];
+  // 手势事件：{t, type:'start'|'change'|'stop'}
+  const hintEvents = [];
+  // 旋律片段（最终）：{midi, start, dur}
+  const notes = [];
+
+  // 参数
+  const MIN_F = 80, MAX_F = 1000;     // 人声常见范围
+  const ENERGY_TH = 0.01;             // 静音门限（均方）
+  const MIN_NOTE_MS = 80;             // 最小切分时长（去抖保护）
+  const ALIGN_WIN = 0.18;             // 触控与音频对齐窗口（秒）
+  const RELEASE_GAP = 0.12;           // 估计停音的最小空白（秒）
+
+  // ---------- 震动 ----------
+  const vibrateOK = 'vibrate' in navigator;
+  $('#vibChip').textContent = `Vibrate: ${vibrateOK ? 'on' : 'off'}`;
+  const vib = ms => { if (vibrateOK) try { navigator.vibrate(ms); } catch(e){} };
+
+  // ---------- UI：色块交互 ----------
+  const lanes = $('#lanes');
+  const laneDivs = $$('.lane');
+
+  function laneFromTouch(clientY){
+    const rect = lanes.getBoundingClientRect();
+    if (clientY < rect.top || clientY > rect.bottom) return -1;
+    const y = clientY - rect.top;
+    const h = rect.height;
+    const idx = Math.floor(y / (h / laneDivs.length));
+    return clamp(idx,0,laneDivs.length-1);
+  }
+
+  function setActiveLane(i){
+    if (laneActive === i) return;
+    if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.remove('active');
+    laneActive = i;
+    if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.add('active');
+  }
+
+  function markHint(type){
+    if (!isRecording || !ctx) return;
+    const t = ctx.currentTime;
+    hintEvents.push({t, type});
+    // 轻触反馈（若支持）
+    if (type==='start' || type==='change' || type==='stop') vib(8);
+  }
+
+  // 触摸事件（移动端主路径）
+  lanes.addEventListener('touchstart', (e)=>{
+    e.preventDefault();
+    const i = laneFromTouch(e.touches[0].clientY);
+    if (i>=0){ setActiveLane(i); markHint('start'); }
+  }, {passive:false});
+
+  lanes.addEventListener('touchmove', (e)=>{
+    e.preventDefault();
+    const i = laneFromTouch(e.touches[0].clientY);
+    if (i>=0 && i!==laneActive){ setActiveLane(i); markHint('change'); }
+    if (i<0 && laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+  }, {passive:false});
+
+  lanes.addEventListener('touchend', (e)=>{
+    e.preventDefault();
+    setActiveLane(-1); markHint('stop');
+  }, {passive:false});
+
+  // 同步支持鼠标（桌面调试）
+  lanes.addEventListener('mousedown', (e)=>{
+    const i = laneFromTouch(e.clientY);
+    if (i>=0){ setActiveLane(i); markHint('start'); }
+  });
+  lanes.addEventListener('mousemove', (e)=>{
+    if (e.buttons!==1) return;
+    const i = laneFromTouch(e.clientY);
+    if (i>=0 && i!==laneActive){ setActiveLane(i); markHint('change'); }
+    if (i<0 && laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+  });
+  window.addEventListener('mouseup', ()=>{
+    if (laneActive!=null){ setActiveLane(-1); markHint('stop'); }
+  });
+
+  // ---------- 音频初始化 ----------
+  async function startRecording(){
+    if (!ctx){
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      sampleRate = ctx.sampleRate;
+      $('#sr').textContent = sampleRate|0;
+    }
+    await ctx.resume();
+
+    micStream = await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:false, noiseSuppression:false, autoGainControl:false
+    }});
+
+    const src = ctx.createMediaStreamSource(micStream);
+
+    // ScriptProcessor 兼容路径（Safari 仍支持）
+    const bufSize = frameSize;
+    $('#buf').textContent = bufSize;
+    procNode = (ctx.createScriptProcessor||ctx.createJavaScriptNode).call(ctx, bufSize, 1, 1);
+    procNode.onaudioprocess = e=>{
+      const input = e.inputBuffer.getChannelData(0);
+      const tCtx = ctx.currentTime; // 近似帧时刻
+      processFrame(input, tCtx);
     };
 
-    const recBtn = document.getElementById('recBtn');
-    const statusEl = document.getElementById('status');
-    const tracks = document.getElementById('tracks');
+    // 可选：能量参考（非必须）
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
 
-    let audioCtx = null;
-    let mediaStream = null;
-    let mediaRecorder = null;
-    let isRecording = false;
+    src.connect(procNode);
+    src.connect(analyser);
+    procNode.connect(ctx.destination); // 处理节点需要连接到 graph 才会触发
 
-    async function ensureAudioContext() {
-      if (!audioCtx) {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        audioCtx = new AC({ sampleRate: 44100 });
+    // 置状态
+    isRecording = true;
+    t0Ctx = ctx.currentTime;
+    pitchBuf.length = 0;
+    hintEvents.length = 0;
+    notes.length = 0;
+    $('#cnt').textContent = '0';
+    $('#noteList').hidden = true;
+
+    $('#btnInit').disabled = true;
+    $('#btnStop').disabled = false;
+    $('#btnPlay').disabled = true;
+    $('#btnExport').disabled = true;
+  }
+
+  function stopRecording(){
+    isRecording = false;
+    try{ procNode.disconnect(); }catch(e){}
+    try{ analyser.disconnect(); }catch(e){}
+    try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
+
+    // 根据收集数据生成音符
+    finalizeAll();
+    renderNoteList();
+
+    $('#btnInit').disabled = false;
+    $('#btnStop').disabled = true;
+    $('#btnPlay').disabled = notes.length===0;
+    $('#btnExport').disabled = notes.length===0;
+  }
+
+  // ---------- 基频估计（自相关简化版） ----------
+  // 返回 {f0, amp}；无可靠峰返回 null
+  function estimateF0ACF(frame, sr){
+    // 预加权 + 能量
+    let sum = 0; for (let i=0;i<frame.length;i++){ const s=frame[i]; sum += s*s; }
+    const energy = sum / frame.length;
+    if (energy < ENERGY_TH) return null;
+
+    // 自相关（限制滞后范围以加速）
+    const minLag = Math.floor(sr / MAX_F);
+    const maxLag = Math.floor(sr / MIN_F);
+    let bestLag = -1, bestCorr = 0;
+
+    // 归一化 ACF （简化）
+    for (let lag=minLag; lag<=maxLag; lag++){
+      let corr = 0;
+      for (let i=0; i<frame.length-lag; i++){
+        corr += frame[i]*frame[i+lag];
       }
-      if (audioCtx.state !== 'running') await audioCtx.resume();
-      return audioCtx;
-    }
-
-    function preferredMime() {
-      const cands = [
-        'audio/mp4;codecs=mp4a.40.2',
-        'audio/mp4',
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        ''
-      ];
-      for (const t of cands) { try { if (!t || MediaRecorder.isTypeSupported(t)) return t; } catch(_) {} }
-      return '';
-    }
-
-    function setBusy(on) {
-      if (on) { document.body.classList.add('busy'); statusEl.textContent='处理中…'; }
-      else { document.body.classList.remove('busy'); }
-    }
-
-    async function startRecording() {
-      await ensureAudioContext();
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation:true, noiseSuppression:true },
-        video: false
-      });
-      const type = preferredMime();
-      mediaRecorder = new MediaRecorder(mediaStream, type ? { mimeType:type } : undefined);
-
-      isRecording = true;
-      recBtn.textContent = '停止并处理';
-      recBtn.setAttribute('aria-pressed','true');
-      statusEl.textContent = '录制中…';
-    }
-
-    function stopTracks() {
-      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-      mediaStream = null;
-    }
-
-    // —— 停止并收集音频：确保拿到最终 dataavailable —— 
-    function stopAndCollect(rec) {
-      return new Promise((resolve) => {
-        const chunks = [];
-        let gotData = false;
-
-        const onData = (e) => {
-          if (e.data && e.data.size) { chunks.push(e.data); gotData = true; }
-        };
-        rec.addEventListener('dataavailable', onData);
-
-        rec.addEventListener('stop', () => {
-          const finish = () => {
-            rec.removeEventListener('dataavailable', onData);
-            const blob = new Blob(chunks, { type: rec.mimeType || 'audio/mp4' });
-            resolve(blob);
-          };
-          if (gotData) finish();
-          else rec.addEventListener('dataavailable', () => finish(), { once: true });
-        }, { once: true });
-
-        rec.stop();
-      });
-    }
-
-    async function stopRecordingAndProcess() {
-      if (!mediaRecorder) return;
-
-      isRecording = false;
-      recBtn.textContent = '开始录制';
-      recBtn.setAttribute('aria-pressed','false');
-      statusEl.textContent = '处理中…';
-      setBusy(true);
-
-      const blob = await stopAndCollect(mediaRecorder);
-      stopTracks();
-      mediaRecorder = null;
-
-      await ensureAudioContext();
-      const arrBuf = await blob.arrayBuffer();
-      const rawBuffer = await audioCtx.decodeAudioData(arrBuf);
-
-      const events = extractQuantizedMelody(rawBuffer, PARAMS);
-
-      const duration = events.totalDuration + 0.4;
-      const rendered = await Tone.Offline(() => {
-        const synth = new Tone.Synth({
-          oscillator: { type: 'triangle' },
-          envelope: { attack: 0.01, decay: 0.08, sustain: 0.2, release: 0.2 }
-        }).toDestination();
-        const reverb = new Tone.Reverb({ decay: 1.4, wet: 0.2 }).toDestination();
-        synth.connect(reverb);
-        for (const ev of events.notes) synth.triggerAttackRelease(ev.freq, ev.dur, ev.time);
-      }, duration);
-
-      const wavBuffer = toWav(rendered);
-      const musicBlob = new Blob([wavBuffer], { type: 'audio/wav' });
-
-      addTrackItem(makeTitle(), musicBlob, {
-        meta: `窗宽 40ms | 覆盖率 0.85 | 片段 ${events.notes.length}`
-      });
-
-      statusEl.textContent = '完成';
-      setBusy(false);
-    }
-
-    recBtn.addEventListener('click', async () => {
-      try {
-        if (!isRecording) await startRecording();
-        else await stopRecordingAndProcess();
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = '失败：' + String(err && err.message || err);
-        recBtn.textContent = '开始录制';
-        recBtn.setAttribute('aria-pressed','false');
-        setBusy(false);
-        stopTracks();
-        mediaRecorder = null;
+      // 近似归一化
+      corr /= (frame.length-lag);
+      if (corr > bestCorr){
+        bestCorr = corr; bestLag = lag;
       }
+    }
+    if (bestLag < 0) return null;
+
+    const f0 = sr / bestLag;
+    return {f0, amp: Math.sqrt(energy)};
+  }
+
+  function processFrame(input, tCtx){
+    // 为减小花销，使用跳步重采样
+    // 叠加缓冲：这里直接以传入帧估计（足够演示）
+    const est = estimateF0ACF(input, sampleRate);
+    if (est){
+      pitchBuf.push({t: tCtx, f0: est.f0, amp: est.amp});
+    }else{
+      pitchBuf.push({t: tCtx, f0: 0, amp: 0});
+    }
+
+    // 若长时间无 hint，也尝试基于“明显变调”自切分（软）
+    autoBoundary();
+  }
+
+  // ---------- 融合：手势边界 + 基频缓存 ----------
+  function sliceByTime(tStart, tEnd){
+    // 抓取 [tStart, tEnd) 的采样
+    const seg = pitchBuf.filter(p => p.t>=tStart && p.t<tEnd && p.f0>0);
+    if (seg.length===0) return null;
+
+    // 取中位数频率，稳健抗抖
+    const fs = seg.map(p=>p.f0).sort((a,b)=>a-b);
+    const fMed = fs[fs.length>>1];
+
+    // 半音量化
+    const midi = Math.round(freq2midi(fMed));
+    const freqQ = midi2freq(midi);
+
+    // 若漂移过大（>100 cents）视为不可靠
+    const ok = seg.filter(p=>Math.abs(cents(p.f0, freqQ))<100).length / seg.length > 0.5;
+    if (!ok) return null;
+
+    return {midi, freq:freqQ};
+  }
+
+  // 根据 hintEvents 即时切分
+  let lastBoundary = null;  // ctxTime
+  function ensureBoundary(t){
+    if (lastBoundary==null) lastBoundary = t0Ctx;
+    // 时间过短不切分（去抖）
+    if ((t - lastBoundary) * 1000 < MIN_NOTE_MS) { lastBoundary = t; return; }
+    const seg = sliceByTime(lastBoundary, t);
+    if (seg){
+      const start = lastBoundary;
+      const dur = t - lastBoundary;
+      notes.push({midi:seg.midi, start, dur});
+      $('#cnt').textContent = String(notes.length);
+    }
+    lastBoundary = t;
+  }
+
+  // 自动边界：当音高跳变明显时（无手势也切）
+  let lastAutoMid = null, lastAutoTime = null;
+  function autoBoundary(){
+    if (pitchBuf.length<3) return;
+    const p = pitchBuf[pitchBuf.length-1];
+    if (p.f0<=0){ // 进入空白：若空白超阈，触发收音
+      if (lastAutoTime && (p.t - lastAutoTime)>RELEASE_GAP && isRecording){
+        ensureBoundary(p.t);
+        lastAutoMid = null; lastAutoTime = null;
+      }
+      return;
+    }
+    const m = freq2midi(p.f0);
+    if (lastAutoMid==null){ lastAutoMid=m; lastAutoTime=p.t; return; }
+    if (Math.abs(m - lastAutoMid) >= 0.8){ // 约等于 > 1 个半音的跳变
+      ensureBoundary(p.t);
+      lastAutoMid = m; lastAutoTime = p.t;
+    }
+  }
+
+  // 停止后收尾：按最后边界到结束时间切一次
+  function finalizeAll(){
+    const tEnd = (pitchBuf.length? pitchBuf[pitchBuf.length-1].t : ctx.currentTime || 0);
+    if (lastBoundary==null) lastBoundary = t0Ctx;
+    if ((tEnd - lastBoundary)*1000 >= MIN_NOTE_MS){
+      const seg = sliceByTime(lastBoundary, tEnd);
+      if (seg){
+        notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
+        $('#cnt').textContent = String(notes.length);
+      }
+    }
+    // 归一化到相对时间 0
+    const t0 = notes.length? notes[0].start : 0;
+    notes.forEach(n=>{ n.start -= t0; });
+  }
+
+  // ---------- 回放 ----------
+  function playNotes(bpm=120){
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const tStart = ctx.currentTime + 0.05;
+    const A=0.0005, D=0.01, S=0.15, R=0.08; // 简单包络
+    const master = ctx.createGain(); master.gain.value = 0.6; master.connect(ctx.destination);
+
+    notes.forEach(n=>{
+      const o=ctx.createOscillator();
+      o.type='sine'; o.frequency.value = midi2freq(n.midi);
+
+      const g=ctx.createGain(); g.gain.value=0;
+      o.connect(g); g.connect(master);
+
+      const t = tStart + n.start;
+      const d = Math.max(0.03, n.dur);
+      // ADSR
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(1.0, t+A);
+      g.gain.linearRampToValueAtTime(S, t+A+D);
+      g.gain.setValueAtTime(S, t+d-R);
+      g.gain.linearRampToValueAtTime(0, t+d);
+
+      o.start(t);
+      o.stop(t+d+0.02);
     });
+  }
 
-    // —— 半音量化旋律提取（固定参数） ——
-    function extractQuantizedMelody(audioBuffer, cfg) {
-      const sr = audioBuffer.sampleRate;
-      const windowSamples = Math.max(1, Math.round(cfg.windowMs * sr / 1000));
-      const hop = Math.max(1, Math.round(windowSamples * (1 - cfg.overlap)));
+  // ---------- 导出 MIDI ----------
+  function exportMIDI(filename='humming.mid'){
+    // Type0, PPQ=480, tempo=120bpm
+    const PPQ=480, BPM=120;
+    const microPerQN = Math.round(60000000/BPM);
 
-      const ch = audioBuffer.numberOfChannels > 1
-        ? mixToMono(audioBuffer)
-        : audioBuffer.getChannelData(0);
-
-      const yin = YIN({ sampleRate: sr });
-      const N = ch.length;
-      const rawNotes = [];
-
-      for (let i = 0; i + windowSamples <= N; i += hop) {
-        const frame = ch.subarray(i, i + windowSamples);
-        const f0 = yin(frame);
-        if (!f0 || !isFinite(f0) || f0 < cfg.minFreq || f0 > cfg.maxFreq) rawNotes.push(null);
-        else rawNotes.push(f0);
-      }
-
-      const frameDur = hop / sr;
-      const quantized = rawNotes.map(f => f ? midiToFreq(Math.round(freqToMidi(f))) : null);
-
-      const events = [];
-      const MIN_DUR = cfg.minDurSec;
-      let t = 0, i = 0;
-      while (i < quantized.length) {
-        const f = quantized[i];
-        let len = 1;
-        while (i + len < quantized.length && quantized[i + len] === f) len++;
-        const dur = len * frameDur;
-        if (f && dur >= MIN_DUR) events.push({ time: t, dur, freq: f });
-        t += len * frameDur;
-        i += len;
-      }
-      return { notes: events, totalDuration: t };
-    }
-
-    function freqToMidi(f) { return 69 + 12 * Math.log2(f / 440); }
-    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
-
-    function mixToMono(buffer) {
-      const len = buffer.length, chs = buffer.numberOfChannels;
-      const out = new Float32Array(len);
-      for (let c = 0; c < chs; c++) {
-        const data = buffer.getChannelData(c);
-        for (let i = 0; i < len; i++) out[i] += data[i] / chs;
-      }
-      return out;
-    }
-
-    function makeTitle() {
-      const d = new Date(), pad = n => String(n).padStart(2,'0');
-      return `处理音乐_${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
-    }
-
-    function addTrackItem(title, blob, { meta }) {
-      const url = URL.createObjectURL(blob);
-      const li = document.createElement('li'); li.className = 'track';
-      const playBtn = document.createElement('button'); playBtn.className='play'; playBtn.textContent='▶︎';
-      const audio = document.createElement('audio'); audio.src=url; audio.preload='metadata';
-      const metaBox = document.createElement('div'); metaBox.className='meta';
-      const titleEl = document.createElement('div'); titleEl.className='title'; titleEl.textContent=title;
-      const sub = document.createElement('div'); sub.className='sub'; sub.textContent=meta||'';
-      metaBox.appendChild(titleEl); metaBox.appendChild(sub);
-      const actions = document.createElement('div'); actions.className='actions';
-      const dl = document.createElement('a'); dl.textContent='导出WAV'; dl.download=`${title}.wav`; dl.href=url; actions.appendChild(dl);
-      li.appendChild(playBtn); li.appendChild(metaBox); li.appendChild(actions); li.appendChild(audio);
-      tracks.prepend(li);
-
-      let isPlaying = false;
-      function stopAllOthers() {
-        document.querySelectorAll('#tracks audio').forEach(a => { if (a!==audio) a.pause(); });
-        document.querySelectorAll('#tracks .play').forEach(b => { if (b!==playBtn) b.textContent='▶︎'; });
-      }
-      function toggle() { stopAllOthers(); isPlaying ? audio.pause() : audio.play(); }
-      playBtn.addEventListener('click', e => { e.stopPropagation(); toggle(); });
-      li.addEventListener('click', () => toggle());
-      audio.addEventListener('play',  () => { isPlaying=true;  playBtn.textContent='⏸︎'; });
-      audio.addEventListener('pause', () => { isPlaying=false; playBtn.textContent='▶︎'; });
-      audio.addEventListener('ended', () => { isPlaying=false; playBtn.textContent='▶︎'; });
-      window.addEventListener('beforeunload', () => URL.revokeObjectURL(url));
-    }
-
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) document.querySelectorAll('#tracks audio').forEach(a => a.pause());
+    // 计算 delta-ticks
+    const events = [];
+    let lastTick = 0;
+    notes.forEach(n=>{
+      const tickOn = Math.round(n.start * (PPQ*BPM/60));
+      const tickOff = Math.round((n.start+n.dur) * (PPQ*BPM/60));
+      const key = clamp(n.midi, 0, 127)|0;
+      events.push({tick:tickOn, type:0x90, key, vel:96});
+      events.push({tick:tickOff, type:0x80, key, vel:0});
     });
-  </script>
+    events.sort((a,b)=>a.tick-b.tick);
+
+    function vlq(n){ // 可变长
+      const bytes=[];
+      let buffer = n & 0x7F;
+      while((n >>= 7)){
+        buffer <<= 8; buffer |= ((n & 0x7F) | 0x80);
+      }
+      while(true){
+        bytes.push(buffer & 0xFF);
+        if (buffer & 0x80) buffer >>= 8; else break;
+      }
+      return bytes;
+    }
+    function push(arr,...xs){ xs.forEach(x=>arr.push(x&0xFF)); }
+
+    // Header
+    const header = [];
+    push(header, 0x4d,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01,  (PPQ>>8)&0xFF, PPQ&0xFF);
+
+    // Track
+    let track = [];
+    // Set Tempo
+    track.push(0x00, 0xff, 0x51, 0x03, (microPerQN>>16)&0xFF, (microPerQN>>8)&0xFF, microPerQN&0xFF);
+    // Program Change (Acoustic Grand)
+    track.push(0x00, 0xC0, 0x00);
+
+    let prevTick = 0;
+    events.forEach(ev=>{
+      const dt = ev.tick - prevTick; prevTick = ev.tick;
+      track.push(...vlq(dt), ev.type, ev.key, ev.vel);
+    });
+    // End of Track
+    track.push(0x00, 0xff, 0x2f, 0x00);
+
+    // Track chunk header
+    const len = track.length;
+    const trackHeader = [0x4d,0x54,0x72,0x6b, (len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF];
+
+    const bytes = new Uint8Array(header.length + trackHeader.length + len);
+    bytes.set(header,0); bytes.set(trackHeader,header.length); bytes.set(track,header.length+trackHeader.length);
+
+    const blob = new Blob([bytes], {type:'audio/midi'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ---------- 列表展示 ----------
+  function renderNoteList(){
+    const box = $('#noteList');
+    if (!notes.length){ box.hidden=true; return; }
+    const rows = notes.map((n,i)=> {
+      const hz = midi2freq(n.midi).toFixed(2);
+      const t = (n.start).toFixed(3);
+      const d = (n.dur).toFixed(3);
+      return `${String(i+1).padStart(3,' ')}  MIDI:${n.midi.toString().padStart(3,' ')}  Hz:${hz.padStart(7,' ')}  t:${t.padStart(6,' ')}s  d:${d.padStart(6,' ')}s`;
+    }).join('\n');
+    box.textContent = rows;
+    box.hidden = false;
+  }
+
+  // ---------- 绑定按钮 ----------
+  $('#btnInit').addEventListener('click', startRecording);
+  $('#btnStop').addEventListener('click', stopRecording);
+  $('#btnPlay').addEventListener('click', ()=>playNotes(120));
+  $('#btnExport').addEventListener('click', exportMIDI);
+
+})();
+</script>
 </body>
 </html>
