@@ -26,7 +26,7 @@
   .lane{position:relative;height:14.2857%; user-select:none;}
   .lane:nth-child(odd){background:var(--lane-a)}
   .lane:nth-child(even){background:var(--lane-b)}
-  /* 稳定变浅：叠加白色半透明层（不再用 filter） */
+  /* 变浅用 overlay，避免 Safari filter 问题 */
   .lane::after{content:""; position:absolute; inset:0; background:rgba(255,255,255,0); transition:background .06s ease;}
   .lane.active::after{ background:rgba(255,255,255,0.22); }
   .gutter{position:absolute;inset:auto 0 0 0;height:0}
@@ -48,7 +48,7 @@
       <span id="vibChip" class="chip">Vibrate: auto</span>
     </label>
     <div class="stat">
-      采样<span id="sr">-</span>Hz · 帧<span id="buf">2048</span> · 片段<span id="cnt">0</span>
+      采样<span id="sr">-</span>Hz · 片段<span id="cnt">0</span>
     </div>
   </header>
 
@@ -78,7 +78,7 @@
   const cents = (f1,f2)=>1200*Math.log2(f1/f2);
 
   // ---- 状态 ----
-  let ctx, micStream, procNode, analyser, zeroGain;
+  let ctx, micStream, analyser, zeroGain, rafId=null;
   let sampleRate = 48000;
   let isRecording = false;
   let t0Ctx = 0;
@@ -89,9 +89,9 @@
 
   // ---- 参数 ----
   const MIN_F = 80, MAX_F = 1000;
-  const ENERGY_TH = 0.0005;  // 放宽以减少漏检
+  const ENERGY_TH = 0.0005;
   const MIN_NOTE_MS = 80;
-  const RELEASE_GAP = 0.10;
+  const RELEASE_GAP = 0.12;
 
   // 震动
   const vibrateOK = 'vibrate' in navigator;
@@ -117,7 +117,6 @@
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.remove('active');
     laneActive = null;
   }
-
   function onGesture(){
     if (!isRecording || !ctx) return;
     const t = ctx.currentTime;
@@ -125,22 +124,17 @@
     vib(8);
   }
 
-  // 仅在录制中处理触摸/鼠标，录制外直接返回（不变色）
+  // 仅在录制中处理触摸/鼠标
   lanes.addEventListener('touchstart', (e)=>{ if(!isRecording) return;
-    e.preventDefault();
-    const i = laneFromY(e.touches[0].clientY);
+    e.preventDefault(); const i = laneFromY(e.touches[0].clientY);
     if (i>=0){ setActiveLane(i); onGesture(); }
   }, {passive:false});
   lanes.addEventListener('touchmove', (e)=>{ if(!isRecording) return;
-    e.preventDefault();
-    const i = laneFromY(e.touches[0].clientY);
+    e.preventDefault(); const i = laneFromY(e.touches[0].clientY);
     if (i>=0 && i!==laneActive){ setActiveLane(i); onGesture(); }
     if (i<0 && laneActive!=null){ clearActiveLane(); onGesture(); }
   }, {passive:false});
-  lanes.addEventListener('touchend', (e)=>{ if(!isRecording) return;
-    e.preventDefault(); clearActiveLane(); onGesture();
-  }, {passive:false});
-
+  lanes.addEventListener('touchend', (e)=>{ if(!isRecording) return; e.preventDefault(); clearActiveLane(); onGesture(); }, {passive:false});
   lanes.addEventListener('mousedown', (e)=>{ if(!isRecording) return;
     const i = laneFromY(e.clientY); if (i>=0){ setActiveLane(i); onGesture(); }
   });
@@ -151,7 +145,7 @@
   });
   window.addEventListener('mouseup', ()=>{ if(!isRecording) return; clearActiveLane(); onGesture(); });
 
-  // ---- 录制开关（单一按钮）----
+  // ---- 录制开关 ----
   $('#btnRec').addEventListener('click', async ()=>{
     if (!isRecording) await startRecording(); else stopRecording();
   });
@@ -169,18 +163,15 @@
     }});
     const src = ctx.createMediaStreamSource(micStream);
 
-    procNode = (ctx.createScriptProcessor||ctx.createJavaScriptNode).call(ctx, 2048, 1, 1);
-    procNode.onaudioprocess = e=>{
-      const input = e.inputBuffer.getChannelData(0);
-      const tCtx = ctx.currentTime;
-      processFrame(input, tCtx);
-    };
-    zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
-    analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;            // 与 ACF 长度一致
+    analyser.smoothingTimeConstant = 0; // 纯时域帧
+    const workBuf = new Float32Array(analyser.fftSize);
 
-    src.connect(procNode);
+    // 保持图连到输出（静音），避免某些设备下节点被暂停
+    zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
     src.connect(analyser);
-    procNode.connect(zeroGain); zeroGain.connect(ctx.destination); // 保证处理触发，且不回放麦克风
+    src.connect(zeroGain); zeroGain.connect(ctx.destination);
 
     // 状态复位
     isRecording = true;
@@ -192,12 +183,21 @@
 
     // UI
     const b = $('#btnRec'); b.textContent = '停止'; b.classList.remove('primary'); b.classList.add('recOn');
-    updateButtons();
+    updateButtons(); // 开始时禁用播放/导出
+
+    // 轮询采样（替代 ScriptProcessor）
+    const loop = ()=>{
+      analyser.getFloatTimeDomainData(workBuf);
+      processFrame(workBuf, ctx.currentTime);
+      rafId = requestAnimationFrame(loop);
+    };
+    rafId = requestAnimationFrame(loop);
   }
 
   function stopRecording(){
     isRecording = false;
-    try{ procNode.disconnect(); }catch(e){}
+
+    if (rafId){ cancelAnimationFrame(rafId); rafId=null; }
     try{ analyser.disconnect(); }catch(e){}
     try{ zeroGain.disconnect(); }catch(e){}
     try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
@@ -212,8 +212,10 @@
 
   function updateButtons(){
     const has = notes.length>0;
-    $('#btnPlay').disabled = !has;
-    $('#btnExport').disabled = !has;
+    const play = $('#btnPlay'), exp = $('#btnExport');
+    play.disabled = !has; exp.disabled = !has;
+    if (has){ play.removeAttribute('disabled'); exp.removeAttribute('disabled'); }
+    else { play.setAttribute('disabled',''); exp.setAttribute('disabled',''); }
     $('#cnt').textContent = String(notes.length);
   }
 
@@ -270,35 +272,32 @@
     return {midi, freq:fq};
   }
 
-  // 关键修复：去抖时不再重置 lastBoundary，防止整段被抹掉
+  // 去抖：短于阈值直接忽略，不改写 lastBoundary
   function ensureBoundary(t){
     if (!ctx) return;
     if (lastBoundary==null) lastBoundary = t0Ctx;
-    if ((t - lastBoundary)*1000 < MIN_NOTE_MS) return;   // 直接忽略过密边界
+    if ((t - lastBoundary)*1000 < MIN_NOTE_MS) return;
     const seg = sliceByTime(lastBoundary, t);
-    if (seg){
-      notes.push({midi:seg.midi, start:lastBoundary, dur:t-lastBoundary});
-    }
+    if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:t-lastBoundary});
     lastBoundary = t;
   }
 
   function finalizeAll(){
-    const tEnd = (pitchBuf.length? pitchBuf[pitchBuf.length-1].t : (ctx?ctx.currentTime:0));
+    const tEnd = pitchBuf.length ? pitchBuf[pitchBuf.length-1].t : (ctx?ctx.currentTime:0);
     if (lastBoundary==null) lastBoundary = t0Ctx;
     if ((tEnd - lastBoundary)*1000 >= MIN_NOTE_MS){
       const seg = sliceByTime(lastBoundary, tEnd);
       if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
     }
-    // 归一化到 0
+    // 归一化到 0；若仍为空且采到过 f0，用兜底一段
     if (notes.length){
       const t0 = notes[0].start; notes.forEach(n=>{ n.start -= t0; });
     }else{
-      // 兜底：无切分但存在可用 f0 时，输出一段，保证可播/可导出
-      const any = pitchBuf.find(p=>p.f0>0);
+      const any = pitchBuf.find(p=>p.f0>0) || (lastF0? {f0:lastF0}: null);
       if (any){
         const midi = Math.round(freq2midi(any.f0));
-        const start = 0, dur = Math.max(0.2, tEnd - t0Ctx);
-        notes.push({midi, start, dur});
+        const dur = Math.max(0.2, tEnd - t0Ctx);
+        notes.push({midi, start:0, dur});
       }
     }
   }
@@ -360,12 +359,9 @@
     const bytes = new Uint8Array(header.length + trackHeader.length + len);
     bytes.set(header,0); bytes.set(trackHeader,header.length); bytes.set(track,header.length+trackHeader.length);
 
-    const blob = new Blob([bytes], {type:'audio/midi'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'humming.mid';
-    document.body.appendChild(a);
-    a.click();
+    const blob = new Blob([bytes], {type:'application/octet-stream'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'humming.mid';
+    document.body.appendChild(a); a.click();
     setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 0);
   });
 
