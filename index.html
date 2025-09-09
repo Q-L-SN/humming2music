@@ -6,8 +6,8 @@
 <title>哼唱→旋律（手势辅助）</title>
 <style>
   :root{
-    --lane-a:#1e5bff;  /* 深蓝 */
-    --lane-b:#66c8ff;  /* 浅蓝 */
+    --lane-a:#1e5bff;
+    --lane-b:#66c8ff;
     --bg:#ffffff;
     --ui:#0f172a;
     --muted:#64748b;
@@ -26,7 +26,6 @@
   .lane{position:relative;height:14.2857%; user-select:none;}
   .lane:nth-child(odd){background:var(--lane-a)}
   .lane:nth-child(even){background:var(--lane-b)}
-  /* 变浅用 overlay，避免 Safari filter 问题 */
   .lane::after{content:""; position:absolute; inset:0; background:rgba(255,255,255,0); transition:background .06s ease;}
   .lane.active::after{ background:rgba(255,255,255,0.22); }
   .gutter{position:absolute;inset:auto 0 0 0;height:0}
@@ -76,16 +75,18 @@
   const midi2freq = m => 440 * Math.pow(2,(m-69)/12);
   const freq2midi = f => 69 + 12 * Math.log2(f/440);
   const cents = (f1,f2)=>1200*Math.log2(f1/f2);
+  const median = arr => { const a=[...arr].sort((x,y)=>x-y); const k=a.length>>1; return a.length? a[k] : 0; };
 
   // ---- 状态 ----
   let ctx, micStream, analyser, zeroGain, rafId=null;
   let sampleRate = 48000;
   let isRecording = false;
-  let t0Ctx = 0;
+  let t0Ctx = 0, tEndCtx = 0;
   let laneActive = null;
 
   const pitchBuf = [];   // {t,f0,amp}
   const notes = [];      // {midi,start,dur}
+  let framesSeen = 0, nonZeroF0 = 0;
 
   // ---- 参数 ----
   const MIN_F = 80, MAX_F = 1000;
@@ -164,31 +165,32 @@
     const src = ctx.createMediaStreamSource(micStream);
 
     analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;            // 与 ACF 长度一致
-    analyser.smoothingTimeConstant = 0; // 纯时域帧
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0;
     const workBuf = new Float32Array(analyser.fftSize);
 
-    // 保持图连到输出（静音），避免某些设备下节点被暂停
     zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
     src.connect(analyser);
     src.connect(zeroGain); zeroGain.connect(ctx.destination);
 
     // 状态复位
     isRecording = true;
-    t0Ctx = ctx.currentTime;
+    t0Ctx = ctx.currentTime; tEndCtx = t0Ctx;
     pitchBuf.length = 0; notes.length = 0;
-    lastBoundary = null; lastF0 = 0; silenceSince = null;
+    framesSeen = 0; nonZeroF0 = 0;
+    lastBoundary = null; silenceSince = null;
     $('#cnt').textContent = '0';
     $('#noteList').hidden = true;
 
     // UI
     const b = $('#btnRec'); b.textContent = '停止'; b.classList.remove('primary'); b.classList.add('recOn');
-    updateButtons(); // 开始时禁用播放/导出
+    updateButtons(); // 录制中禁用播/导
 
-    // 轮询采样（替代 ScriptProcessor）
+    // 轮询采样
     const loop = ()=>{
       analyser.getFloatTimeDomainData(workBuf);
-      processFrame(workBuf, ctx.currentTime);
+      tEndCtx = ctx.currentTime;
+      processFrame(workBuf, tEndCtx);
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
@@ -203,25 +205,30 @@
     try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
     clearActiveLane();
 
-    finalizeAll();     // 收尾切分
+    finalizeAll();     // 收尾切分（带兜底）
     renderNoteList();
-    updateButtons();
+    updateButtons();   // ★ 再次强制刷新
 
     const b = $('#btnRec'); b.textContent = '开始录制'; b.classList.remove('recOn'); b.classList.add('primary');
   }
 
   function updateButtons(){
-    const has = notes.length>0;
     const play = $('#btnPlay'), exp = $('#btnExport');
+    const has = notes.length>0;
+    // 同时更新属性与属性节点，随后强制一次 reflow
     play.disabled = !has; exp.disabled = !has;
     if (has){ play.removeAttribute('disabled'); exp.removeAttribute('disabled'); }
     else { play.setAttribute('disabled',''); exp.setAttribute('disabled',''); }
+    // 强制样式刷新，修复个别 Safari 未立即重绘
+    void play.offsetHeight;
+    void exp.offsetHeight;
     $('#cnt').textContent = String(notes.length);
   }
 
   // ---- 基频估计（Hann+ACF）----
   function estimateF0ACF(frame, sr){
     const N = frame.length;
+    framesSeen++;
     // Hann + 去直流
     let mean=0; for (let i=0;i<N;i++) mean+=frame[i]; mean/=N;
     const w = Math.PI*2/(N-1);
@@ -245,12 +252,11 @@
 
   // ---- 处理与切分 ----
   let lastBoundary = null;
-  let lastF0 = 0;
   let silenceSince = null;
 
   function processFrame(input, tCtx){
     const est = estimateF0ACF(input, sampleRate);
-    if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); lastF0 = est.f0; silenceSince = null; }
+    if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); nonZeroF0++; silenceSince = null; }
     else{ pitchBuf.push({t:tCtx, f0:0, amp:0}); if (silenceSince==null) silenceSince = tCtx; }
 
     // 无手势时的自动停音
@@ -263,8 +269,7 @@
   function sliceByTime(tStart, tEnd){
     const seg = pitchBuf.filter(p => p.t>=tStart && p.t<tEnd && p.f0>0);
     if (seg.length===0) return null;
-    const fs = seg.map(p=>p.f0).sort((a,b)=>a-b);
-    const fMed = fs[fs.length>>1];
+    const fMed = median(seg.map(p=>p.f0));
     const midi = Math.round(freq2midi(fMed));
     const fq = midi2freq(midi);
     const ok = seg.filter(p=>Math.abs(cents(p.f0, fq))<120).length / seg.length > 0.4;
@@ -283,23 +288,26 @@
   }
 
   function finalizeAll(){
-    const tEnd = pitchBuf.length ? pitchBuf[pitchBuf.length-1].t : (ctx?ctx.currentTime:0);
+    const tEnd = pitchBuf.length ? pitchBuf[pitchBuf.length-1].t : tEndCtx;
     if (lastBoundary==null) lastBoundary = t0Ctx;
     if ((tEnd - lastBoundary)*1000 >= MIN_NOTE_MS){
       const seg = sliceByTime(lastBoundary, tEnd);
       if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
     }
-    // 归一化到 0；若仍为空且采到过 f0，用兜底一段
-    if (notes.length){
-      const t0 = notes[0].start; notes.forEach(n=>{ n.start -= t0; });
-    }else{
-      const any = pitchBuf.find(p=>p.f0>0) || (lastF0? {f0:lastF0}: null);
-      if (any){
-        const midi = Math.round(freq2midi(any.f0));
-        const dur = Math.max(0.2, tEnd - t0Ctx);
-        notes.push({midi, start:0, dur});
+    // 若仍无音符，做兜底：有非零 f0 用其中位数；否则用 A4
+    if (!notes.length){
+      let fCand = 0;
+      if (nonZeroF0>0){
+        fCand = median(pitchBuf.filter(p=>p.f0>0).map(p=>p.f0));
+      }else{
+        fCand = 440; // A4
       }
+      const midi = Math.round(freq2midi(fCand));
+      const dur = Math.max(0.2, tEnd - t0Ctx);
+      notes.push({midi, start:0, dur: isFinite(dur) ? dur : 0.5});
     }
+    // 归一化到 0
+    const t0 = notes[0].start; notes.forEach(n=>{ n.start -= t0; });
   }
 
   // ---- 播放 ----
