@@ -26,7 +26,7 @@
   .lane{position:relative;height:14.2857%; user-select:none;}
   .lane:nth-child(odd){background:var(--lane-a)}
   .lane:nth-child(even){background:var(--lane-b)}
-  /* 稳定变浅：叠加白色半透明层，避免 Safari filter 重绘问题 */
+  /* 稳定变浅：白色半透明覆盖层 */
   .lane::after{content:""; position:absolute; inset:0; background:rgba(255,255,255,0); transition:background .06s ease;}
   .lane.active::after{ background:rgba(255,255,255,0.22); }
   .gutter{position:absolute;inset:auto 0 0 0;height:0}
@@ -78,19 +78,15 @@
   const cents = (f1,f2)=>1200*Math.log2(f1/f2);
   const median = arr => { const a=[...arr].sort((x,y)=>x-y); const k=a.length>>1; return a.length? a[k] : 0; };
 
-  // ===== 全局音频上下文与主增益（防止被 GC） =====
-  let ctx = null, master = null, audioUnlocked = false;
-  async function unlockAudioOnce(){
+  // ===== AudioContext & 主增益（全局唯一）=====
+  let ctx = null, master = null;
+  async function ensureAudioGraph(){
     if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (ctx.state !== 'running') await ctx.resume();
-    if (!audioUnlocked){
-      // iOS 解锁：播放一次极短静音
-      const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
-      const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start(0);
-      audioUnlocked = true;
-    }
     if (!master){
-      master = ctx.createGain(); master.gain.value = 0.6; master.connect(ctx.destination);
+      master = ctx.createGain();
+      master.gain.setValueAtTime(0.6, ctx.currentTime);
+      master.connect(ctx.destination);
     }
   }
 
@@ -107,7 +103,7 @@
 
   // 参数
   const MIN_F = 80, MAX_F = 1000;
-  const ENERGY_TH = 0.0005;      // 放宽静音门限
+  const ENERGY_TH = 0.0005;
   const MIN_NOTE_MS = 80;
   const RELEASE_GAP = 0.12;
 
@@ -116,16 +112,15 @@
   $('#vibChip').textContent = `Vibrate: ${vibrateOK ? 'on' : 'off'}`;
   const vib = ms => { if (vibrateOK) try{ navigator.vibrate(ms);}catch(e){} };
 
-  // ===== 触控 UI（仅录制时生效；录制外不变色） =====
+  // ===== 触控 UI（仅录制时生效）=====
   const lanes = $('#lanes');
   const laneDivs = $$('.lane');
-
   function laneFromY(clientY){
     const rect = lanes.getBoundingClientRect();
     if (clientY < rect.top || clientY > rect.bottom) return -1;
     const idx = Math.floor((clientY - rect.top) / (rect.height / laneDivs.length));
     return clamp(idx,0,laneDivs.length-1);
-    }
+  }
   function setActiveLane(i){
     if (laneActive === i) return;
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.remove('active');
@@ -136,7 +131,6 @@
     if (laneActive!=null && laneActive>=0) laneDivs[laneActive].classList.remove('active');
     laneActive = null;
   }
-
   function onGesture(){
     if (!isRecording || !ctx) return;
     const t = ctx.currentTime;
@@ -165,14 +159,14 @@
   });
   window.addEventListener('mouseup', ()=>{ if(!isRecording) return; clearActiveLane(); onGesture(); });
 
-  // ===== 录制开关（合并按钮）=====
+  // ===== 录制开关 =====
   const btnRec = $('#btnRec'), btnPlay = $('#btnPlay'), btnExport = $('#btnExport');
   btnRec.addEventListener('click', async ()=>{
     if (!isRecording) await startRecording(); else stopRecording();
   });
 
   async function startRecording(){
-    await unlockAudioOnce();                  // ★ 先解锁音频
+    await ensureAudioGraph();
     sampleRate = ctx.sampleRate;
     $('#sr').textContent = sampleRate|0;
 
@@ -182,11 +176,11 @@
     const src = ctx.createMediaStreamSource(micStream);
 
     analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;                 // 与 ACF 长度一致
+    analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0;
     const workBuf = new Float32Array(analyser.fftSize);
 
-    // 静音支路，保证图不断开（某些 iOS 设备否则会“睡死”）
+    // 静音支路保持图活跃
     zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
     src.connect(analyser);
     src.connect(zeroGain); zeroGain.connect(ctx.destination);
@@ -203,9 +197,9 @@
     // UI
     btnRec.textContent = '停止';
     btnRec.classList.remove('primary'); btnRec.classList.add('recOn');
-    updateButtons(); // 录制中禁用播/导
+    updateButtons();
 
-    // 轮询采样（替代 ScriptProcessorNode）
+    // 轮询采样
     const loop = ()=>{
       analyser.getFloatTimeDomainData(workBuf);
       tEndCtx = ctx.currentTime;
@@ -222,11 +216,12 @@
     try{ analyser.disconnect(); }catch(e){}
     try{ zeroGain.disconnect(); }catch(e){}
     try{ micStream.getTracks().forEach(t=>t.stop()); }catch(e){}
+    analyser = null; zeroGain = null; micStream = null;
     clearActiveLane();
 
     finalizeAll();     // 收尾切分（含兜底）
     renderNoteList();
-    updateButtons();   // 强制刷新按钮状态
+    updateButtons();
 
     btnRec.textContent = '开始录制';
     btnRec.classList.remove('recOn'); btnRec.classList.add('primary');
@@ -237,7 +232,6 @@
     btnPlay.disabled = !has; btnExport.disabled = !has;
     if (has){ btnPlay.removeAttribute('disabled'); btnExport.removeAttribute('disabled'); }
     else { btnPlay.setAttribute('disabled',''); btnExport.setAttribute('disabled',''); }
-    // iOS Safari 个别渲染滞后，强制 reflow
     void btnPlay.offsetHeight; void btnExport.offsetHeight;
     $('#cnt').textContent = String(notes.length);
   }
@@ -275,7 +269,6 @@
     if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); nonZeroF0++; silenceSince = null; }
     else { pitchBuf.push({t:tCtx, f0:0, amp:0}); if (silenceSince==null) silenceSince = tCtx; }
 
-    // 无手势时的自动停音（持续静音触发一次边界）
     if (silenceSince!=null && (tCtx - silenceSince) > RELEASE_GAP && isRecording){
       ensureBoundary(tCtx);
       silenceSince = null;
@@ -286,19 +279,17 @@
     const seg = pitchBuf.filter(p => p.t>=tStart && p.t<tEnd && p.f0>0);
     if (seg.length===0) return null;
     const fMed = median(seg.map(p=>p.f0));
-    const midi = Math.round(freq2midi(fMed));     // **半音量化**
+    const midi = Math.round(freq2midi(fMed));     // 半音量化
     const fq = midi2freq(midi);
-    // 一致性校验（±120 cents 之内占比 > 40%）
     const ok = seg.filter(p=>Math.abs(cents(p.f0, fq))<120).length / seg.length > 0.4;
     if (!ok) return null;
     return {midi, freq:fq};
   }
 
-  // 去抖：太密的边界直接忽略，不改写 lastBoundary
   function ensureBoundary(t){
     if (!ctx) return;
     if (lastBoundary==null) lastBoundary = t0Ctx;
-    if ((t - lastBoundary)*1000 < MIN_NOTE_MS) return;
+    if ((t - lastBoundary)*1000 < MIN_NOTE_MS) return; // 去抖
     const seg = sliceByTime(lastBoundary, t);
     if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:t-lastBoundary});
     lastBoundary = t;
@@ -311,53 +302,53 @@
       const seg = sliceByTime(lastBoundary, tEnd);
       if (seg) notes.push({midi:seg.midi, start:lastBoundary, dur:tEnd-lastBoundary});
     }
-    // 若仍无音符：有非零 f0 用中位数；否则用 A4（69）
     if (!notes.length){
-      let fCand = 0;
-      if (nonZeroF0>0){
-        fCand = median(pitchBuf.filter(p=>p.f0>0).map(p=>p.f0));
-      }else{
-        fCand = 440;
-      }
+      let fCand = (nonZeroF0>0) ? median(pitchBuf.filter(p=>p.f0>0).map(p=>p.f0)) : 440;
       const midi = Math.round(freq2midi(fCand));
       const dur = Math.max(0.2, tEnd - t0Ctx);
       notes.push({midi, start:0, dur: isFinite(dur) ? dur : 0.5});
     }
-    // 归一化到 0
+    // 归一化
     const t0 = notes[0].start; notes.forEach(n=>{ n.start -= t0; });
   }
 
-  // ===== 播放（含解锁与“防过去时间”）=====
-  const scheduledKeep = []; // 保留节点引用直到 stop，防 GC
+  // ===== 播放（纯逻辑修正版）=====
+  const keepRefs = new Set(); // 防止节点提前回收
   btnPlay.addEventListener('click', async ()=>{
     if (!notes.length) return;
-    await unlockAudioOnce();   // 再次确保已解锁并 Running
+    await ensureAudioGraph();
 
-    // 基准起点；避免把事件排在“过去”
-    const base = Math.max(ctx.currentTime + 0.12, 0);
-    const A=0.0005, D=0.01, S=0.15, R=0.08;
+    const base = ctx.currentTime + 0.15;  // 充足的未来时间
+    const A=0.01, D=0.05, S=0.25, R=0.05; // 更稳的包络常数
 
     notes.forEach(n=>{
-      const o=ctx.createOscillator(); o.type='sine'; o.frequency.value = midi2freq(n.midi);
-      const g=ctx.createGain(); g.gain.value=0; o.connect(g); g.connect(master);
-      const startTime = Math.max(base + n.start, ctx.currentTime + 0.02);
-      const d = Math.max(0.03, n.dur);
+      const midi = isFinite(n.midi) ? clamp(n.midi, 0, 127) : 69;
+      const hz = midi2freq(midi);
+      const startTime = Math.max(base + Math.max(0, n.start||0), ctx.currentTime + 0.02);
+      const d = Math.max(0.05, n.dur||0.2);
 
-      // ADSR
+      const osc = ctx.createOscillator();
+      const g   = ctx.createGain();
+
+      // 关键：先取消任何残留的自动化，然后明确设值与包络
+      g.gain.cancelScheduledValues(0);
+      osc.frequency.cancelScheduledValues(0);
+
+      osc.frequency.setValueAtTime(hz, startTime);
       g.gain.setValueAtTime(0, startTime);
       g.gain.linearRampToValueAtTime(1.0, startTime + A);
-      g.gain.linearRampToValueAtTime(S,    startTime + A + D);
-      g.gain.setValueAtTime(S,             startTime + d - R);
-      g.gain.linearRampToValueAtTime(0,    startTime + d);
+      g.gain.linearRampToValueAtTime(S,   startTime + A + D);
+      g.gain.setValueAtTime(S,            startTime + d - R);
+      g.gain.linearRampToValueAtTime(0,   startTime + d);
 
-      o.start(startTime);
-      o.stop(startTime + d + 0.02);
+      osc.type='sine';
+      osc.connect(g); g.connect(master);
 
-      // 保持引用直到结束
-      scheduledKeep.push(o,g);
-      setTimeout(()=>{ const k=scheduledKeep.indexOf(o); if(k>=0) scheduledKeep.splice(k,1);
-                       const k2=scheduledKeep.indexOf(g); if(k2>=0) scheduledKeep.splice(k2,1); },
-                 Math.ceil((startTime + d + 0.05 - ctx.currentTime)*1000));
+      osc.start(startTime);
+      osc.stop(startTime + d + 0.02);
+
+      keepRefs.add(osc); keepRefs.add(g);
+      setTimeout(()=>{ keepRefs.delete(osc); keepRefs.delete(g); }, Math.ceil((startTime + d + 0.2 - ctx.currentTime)*1000));
     });
   });
 
@@ -366,12 +357,11 @@
     if (!notes.length) return;
     const PPQ=480, BPM=120;
     const microPerQN = Math.round(60000000/BPM);
-
     const events = [];
     notes.forEach(n=>{
-      const tickOn  = Math.round(n.start * (PPQ*BPM/60));
-      const tickOff = Math.round((n.start+n.dur) * (PPQ*BPM/60));
-      const key = clamp(n.midi, 0, 127)|0;
+      const tickOn  = Math.round(Math.max(0,n.start) * (PPQ*BPM/60));
+      const tickOff = Math.round(Math.max(0,n.start+n.dur) * (PPQ*BPM/60));
+      const key = clamp(isFinite(n.midi)?n.midi:69, 0, 127)|0;
       events.push({tick:tickOn, type:0x90, key, vel:96});
       events.push({tick:tickOff, type:0x80, key, vel:0});
     });
@@ -383,15 +373,11 @@
       return bytes; }
     function push(arr,...xs){ xs.forEach(x=>arr.push(x&0xFF)); }
 
-    // Header
     const header = [];
     push(header, 0x4d,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01,  (PPQ>>8)&0xFF, PPQ&0xFF);
 
-    // Track
     let track = [];
-    // Tempo
     track.push(0x00, 0xff, 0x51, 0x03, (microPerQN>>16)&0xFF, (microPerQN>>8)&0xFF, microPerQN&0xFF);
-    // Program Change: Acoustic Grand
     track.push(0x00, 0xC0, 0x00);
 
     let prevTick = 0;
@@ -399,16 +385,13 @@
       const dt = ev.tick - prevTick; prevTick = ev.tick;
       track.push(...vlq(dt), ev.type, ev.key, ev.vel);
     });
-    // End of Track
     track.push(0x00, 0xff, 0x2f, 0x00);
 
     const len = track.length;
     const trackHeader = [0x4d,0x54,0x72,0x6b, (len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF];
-
     const bytes = new Uint8Array(header.length + trackHeader.length + len);
     bytes.set(header,0); bytes.set(trackHeader,header.length); bytes.set(track,header.length+trackHeader.length);
 
-    // Safari 更稳的 MIME
     const blob = new Blob([bytes], {type:'application/octet-stream'});
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'humming.mid';
     document.body.appendChild(a); a.click();
@@ -420,10 +403,10 @@
     const box = $('#noteList');
     if (!notes.length){ box.hidden=true; return; }
     const rows = notes.map((n,i)=> {
-      const hz = midi2freq(n.midi).toFixed(2);
-      const t = (n.start).toFixed(3);
-      const d = (n.dur).toFixed(3);
-      return `${String(i+1).padStart(3,' ')}  MIDI:${n.midi.toString().padStart(3,' ')}  Hz:${hz.padStart(7,' ')}  t:${t.padStart(6,' ')}s  d:${d.padStart(6,' ')}s`;
+      const hz = midi2freq(clamp(n.midi,0,127)).toFixed(2);
+      const t = (Math.max(0,n.start)).toFixed(3);
+      const d = (Math.max(0,n.dur)).toFixed(3);
+      return `${String(i+1).padStart(3,' ')}  MIDI:${(clamp(n.midi,0,127)).toString().padStart(3,' ')}  Hz:${hz.padStart(7,' ')}  t:${t.padStart(6,' ')}s  d:${d.padStart(6,' ')}s`;
     }).join('\n');
     box.textContent = rows;
     box.hidden = false;
