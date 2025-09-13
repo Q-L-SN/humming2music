@@ -81,7 +81,11 @@
   // ===== AudioContext & 主增益（全局唯一）=====
   let ctx = null, master = null;
   async function ensureAudioGraph(){
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // 某些浏览器在麦克风停止后会关闭 AudioContext
+    if (!ctx || ctx.state === 'closed'){
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = null; // 需重新创建主增益节点
+    }
     if (ctx.state !== 'running') await ctx.resume();
     if (!master){
       master = ctx.createGain();
@@ -179,6 +183,7 @@
     analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0;
     const workBuf = new Float32Array(analyser.fftSize);
+    const specBuf = new Float32Array(analyser.frequencyBinCount);
 
     // 静音支路保持图活跃
     zeroGain = ctx.createGain(); zeroGain.gain.value = 0;
@@ -202,8 +207,9 @@
     // 轮询采样
     const loop = ()=>{
       analyser.getFloatTimeDomainData(workBuf);
+      analyser.getFloatFrequencyData(specBuf);
       tEndCtx = ctx.currentTime;
-      processFrame(workBuf, tEndCtx);
+      processFrame(workBuf, specBuf, tEndCtx);
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
@@ -236,38 +242,40 @@
     $('#cnt').textContent = String(notes.length);
   }
 
-  // ===== 基频估计（Hann + 自相关）=====
-  function estimateF0ACF(frame, sr){
-    const N = frame.length; framesSeen++;
-    // 去直流 + Hann
-    let mean=0; for (let i=0;i<N;i++) mean+=frame[i]; mean/=N;
-    const w = Math.PI*2/(N-1);
-    let energy=0; const x = new Float32Array(N);
-    for (let i=0;i<N;i++){ const s=(frame[i]-mean)*(0.5-0.5*Math.cos(w*i)); x[i]=s; energy+=s*s; }
-    energy/=N;
-    if (energy < ENERGY_TH) return null;
-
-    const minLag = Math.floor(sr / MAX_F);
-    const maxLag = Math.floor(sr / MIN_F);
-    let bestLag = -1, best = 0;
-    for (let lag=minLag; lag<=maxLag; lag++){
-      let c=0;
-      for (let i=0; i<N-lag; i++) c += x[i]*x[i+lag];
-      c/= (N-lag);
-      if (c>best){ best=c; bestLag=lag; }
+  // ===== 基频估计（分段 FFT）=====
+  function estimateF0FFT(spec, sr){
+    const N = (spec.length - 1) * 2;
+    const minBin = Math.max(1, Math.floor(MIN_F * N / sr));
+    const maxBin = Math.min(spec.length - 2, Math.floor(MAX_F * N / sr));
+    let bestI = -1, best = -Infinity;
+    for (let i = minBin; i <= maxBin; i++){
+      const v = spec[i];
+      if (v > best){ best = v; bestI = i; }
     }
-    if (bestLag<0) return null;
-    return {f0: sr/bestLag, amp: Math.sqrt(energy)};
+    if (bestI < 0) return null;
+    const a = spec[bestI-1], b = spec[bestI], c = spec[bestI+1];
+    const p = 0.5 * (a - c) / (a - 2*b + c);
+    const freq = (bestI + p) * sr / N;
+    return {f0: freq, amp: Math.pow(10, b/20)};
   }
 
   // ===== 分段与收尾 =====
   let lastBoundary = null;
   let silenceSince = null;
 
-  function processFrame(input, tCtx){
-    const est = estimateF0ACF(input, sampleRate);
-    if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); nonZeroF0++; silenceSince = null; }
-    else { pitchBuf.push({t:tCtx, f0:0, amp:0}); if (silenceSince==null) silenceSince = tCtx; }
+  function processFrame(timeBuf, specBuf, tCtx){
+    framesSeen++;
+    let energy = 0;
+    for (let i = 0; i < timeBuf.length; i++) energy += timeBuf[i] * timeBuf[i];
+    energy /= timeBuf.length;
+    if (energy < ENERGY_TH){
+      pitchBuf.push({t:tCtx, f0:0, amp:0});
+      if (silenceSince==null) silenceSince = tCtx;
+    } else {
+      const est = estimateF0FFT(specBuf, sampleRate);
+      if (est){ pitchBuf.push({t:tCtx, f0:est.f0, amp:est.amp}); nonZeroF0++; silenceSince = null; }
+      else { pitchBuf.push({t:tCtx, f0:0, amp:0}); if (silenceSince==null) silenceSince = tCtx; }
+    }
 
     if (silenceSince!=null && (tCtx - silenceSince) > RELEASE_GAP && isRecording){
       ensureBoundary(tCtx);
