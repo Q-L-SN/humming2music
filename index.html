@@ -81,7 +81,11 @@
   // ===== AudioContext & 主增益（全局唯一）=====
   let ctx = null, master = null;
   async function ensureAudioGraph(){
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // 某些浏览器在麦克风停止后会关闭 AudioContext
+    if (!ctx || ctx.state === 'closed'){
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = null; // 需重新创建主增益节点
+    }
     if (ctx.state !== 'running') await ctx.resume();
     if (!master){
       master = ctx.createGain();
